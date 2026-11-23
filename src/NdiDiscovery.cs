@@ -29,7 +29,7 @@ namespace PcOnSongBridge
                 return await receiver.DiscoverAtAddressAsync(text, token).ConfigureAwait(false);
         }
 
-        private static bool OnLocalNetwork(IPAddress target)
+        internal static bool OnLocalNetwork(IPAddress target)
         {
             byte[] ip = target.GetAddressBytes();
             if (ip[0] == 0 || ip[0] >= 224) return false;
@@ -53,7 +53,7 @@ namespace PcOnSongBridge
 
         internal static async Task<List<NdiSource>> FindAsync(CancellationToken token)
         {
-            var lan = Task.Run(() => BrowseWindows(token), token);
+            var lan = Task.Run(() => BrowseWindows(Service, token), token);
             var native = FindWithRuntimeAsync(token);
             await Task.WhenAll(lan, native).ConfigureAwait(false);
             var sources = new List<NdiSource>(lan.Result);
@@ -104,16 +104,23 @@ namespace PcOnSongBridge
         [DllImport("dnsapi.dll")] private static extern uint DnsServiceBrowseCancel(ref IntPtr cancel);
         [DllImport("dnsapi.dll")] private static extern void DnsFree(IntPtr ptr, int freeType);
         private static readonly BrowseCallback OnRecords = Receive;
-        private static readonly Dictionary<IntPtr, List<NdiSource>> Searches = new Dictionary<IntPtr, List<NdiSource>>();
+        private sealed class BrowseResult
+        {
+            internal readonly string Service;
+            internal readonly List<NdiSource> Sources = new List<NdiSource>();
+            internal BrowseResult(string service) { Service = service; }
+        }
+        private static readonly Dictionary<IntPtr, BrowseResult> Searches = new Dictionary<IntPtr, BrowseResult>();
         private static int sequence;
 
-        private static List<NdiSource> BrowseWindows(CancellationToken token)
+        internal static List<NdiSource> BrowseWindows(string service, CancellationToken token)
         {
             token.ThrowIfCancellationRequested();
-            var sources = new List<NdiSource>();
+            var result = new BrowseResult(service);
+            var sources = result.Sources;
             var id = new IntPtr(Interlocked.Increment(ref sequence));
-            var request = new BrowseRequest { Version = 1, QueryName = Service, Callback = OnRecords, Context = id };
-            lock (Searches) Searches.Add(id, sources);
+            var request = new BrowseRequest { Version = 1, QueryName = service, Callback = OnRecords, Context = id };
+            lock (Searches) Searches.Add(id, result);
             IntPtr cancel = IntPtr.Zero;
             try
             {
@@ -153,11 +160,11 @@ namespace PcOnSongBridge
 
         // dnsapi delivers a DNS-SD service's PTR, SRV and associated address records together.
         // Use the addresses in that result: a second device on the LAN can also call itself Android.local.
-        internal static void Apply(List<NdiSource> sources, IList<Record> records)
+        internal static void Apply(List<NdiSource> sources, IList<Record> records, string service = Service)
         {
             var cmp = StringComparison.OrdinalIgnoreCase;
-            string suffix = "." + Service;
-            foreach (var ptr in records.Where(r => r.Type == 12 && String.Equals(r.Owner, Service, cmp) &&
+            string suffix = "." + service;
+            foreach (var ptr in records.Where(r => r.Type == 12 && String.Equals(r.Owner, service, cmp) &&
                 r.Target != null && r.Target.EndsWith(suffix, cmp)))
             {
                 string name = ptr.Target.Substring(0, ptr.Target.Length - suffix.Length);
@@ -204,8 +211,8 @@ namespace PcOnSongBridge
                 }
                 lock (Searches)
                 {
-                    List<NdiSource> list;
-                    if (Searches.TryGetValue(context, out list)) Apply(list, batch);
+                    BrowseResult result;
+                    if (Searches.TryGetValue(context, out result)) Apply(result.Sources, batch, result.Service);
                 }
             }
             finally { if (packet != IntPtr.Zero) DnsFree(packet, 1); }

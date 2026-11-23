@@ -269,6 +269,7 @@ internal static class UiTests
     private sealed class FakeWifi : WifiCueServices
     {
         internal int Finds, Installs, Starts, Stops;
+        internal int CueGain;
         internal string Endpoint;
         internal NdiSource Source;
         internal readonly NdiReceiverStatus Status = new NdiReceiverStatus();
@@ -295,6 +296,7 @@ internal static class UiTests
         internal override Task StartAsync(string runtime, NdiSource source, string endpoint, CancellationToken token)
         { Starts++; Source = source; Endpoint = endpoint; Status.Running = true; return Starting == null ? Task.FromResult(true) : Starting.Task; }
         internal override NdiReceiverStatus GetStatus() { return Status; }
+        internal override void SetCueGain(int value) { CueGain = value; }
         internal override Task StopAsync()
         { Stops++; return Stopping == null ? Task.FromResult(true) : Stopping.Task; }
     }
@@ -325,6 +327,8 @@ internal static class UiTests
         var tool = main.OfType<TextBox>().Single(box => box.Text == Path.Combine(dir, "scrcpy.exe"));
         string configured = tool.Text;
         tool.Text = Path.Combine(dir, "missing-scrcpy.exe");
+        var midi = main.OfType<Button>().Single(b => b.Text == "Wireless MIDI");
+        if (!midi.Enabled) throw new Exception("Wireless MIDI setup depends on scrcpy.");
         service.Discovering = new TaskCompletionSource<List<NdiSource>>();
         open.PerformClick();
         var dialog = form.OwnedForms.OfType<WifiCuesForm>().Single();
@@ -386,6 +390,15 @@ internal static class UiTests
         if (!status.AccessibilityObject.Name.Contains(status.Text))
             throw new Exception("The Wi-Fi status text was not exposed to assistive technology.");
         var level = controls.OfType<Label>().Single(l => l.AccessibleName == "Wi-Fi audio level");
+        var gain = controls.OfType<TrackBar>().Single(t => t.AccessibleName == "NDI cue gain");
+        if (!midi.Enabled) throw new Exception("NDI playback blocked wireless MIDI.");
+        if (gain.Value != 0 || service.CueGain != 0 || !gain.Enabled) throw new Exception("Expected unity gain on an upgraded installation.");
+        gain.Value = 3;
+        if (service.CueGain != 3 || service.Starts != 1 || service.Stops != 0 || service.Endpoint != "iem-endpoint")
+            throw new Exception("Changing NDI gain restarted playback or changed the selected endpoint.");
+        service.Status.OutputClipped = true;
+        await Until(() => level.Text.Contains("lower NDI cue gain"), "NDI clipping feedback");
+        service.Status.OutputClipped = false;
         if (level.Text.Contains("dropped") || !level.AccessibleDescription.Contains("frames played"))
             throw new Exception("Missing playback counters or misleading warning for clean audio.");
         service.Status.DroppedAudioPackets = 3;
@@ -416,6 +429,8 @@ internal static class UiTests
         using (var reopened = new WifiCuesForm(Preferences.Load(Path.Combine(dir, "settings.xml")), separate, () => true, () => null))
         {
             reopened.Opacity = 0; reopened.Show(form);
+            if (Children(reopened).OfType<TrackBar>().Single(t => t.AccessibleName == "NDI cue gain").Value != 3 || separate.CueGain != 3)
+                throw new Exception("Reopening Wi-Fi cues lost the saved NDI gain.");
             await Until(() => Children(reopened).OfType<ComboBox>().Any(c => c.SelectedItem == separate.Direct[0]), "saved host after a fresh settings load");
             if (separate.Starts != 0 || separate.Finds != 0 || !separate.SearchedHosts.SequenceEqual(new[] { "192.168.30.2" }))
                 throw new Exception("Returning tablet lookup waited for multicast, opened playback, or missed the changed port.");

@@ -14,6 +14,7 @@ namespace PcOnSongBridge
     internal class WifiCueServices
     {
         private NdiReceiver receiver;
+        private int gainDb;
 
         internal virtual string FindRuntime() { return NdiRuntime.FindLibrary(); }
         internal virtual Task InstallAsync(CancellationToken token) { return NdiRuntime.OpenSetupAsync(token); }
@@ -24,7 +25,13 @@ namespace PcOnSongBridge
         internal virtual Task StartAsync(string runtime, NdiSource source, string endpointId, CancellationToken token)
         {
             receiver = new NdiReceiver(runtime);
+            receiver.SetGainDb(gainDb);
             return receiver.StartAsync(source, endpointId, token);
+        }
+        internal virtual void SetCueGain(int value)
+        {
+            gainDb = value;
+            if (receiver != null) receiver.SetGainDb(value);
         }
         internal virtual NdiReceiverStatus GetStatus() { return receiver.GetStatus(); }
         internal virtual async Task StopAsync()
@@ -55,6 +62,13 @@ namespace PcOnSongBridge
         private readonly Button findAt = Button("Find at address");
         private readonly Control addressRow;
         private readonly Button refreshOutputs = Button("Refresh outputs");
+        private readonly TrackBar gain = new TrackBar
+        {
+            AccessibleName = "NDI cue gain", AccessibleDescription = "Decibels applied to the OnSong stream before Windows playback.",
+            Minimum = NdiReceiver.MinGainDb, Maximum = NdiReceiver.MaxGainDb, SmallChange = 1, LargeChange = 3,
+            Width = 195, AutoSize = false, Height = 30, TickFrequency = 6, Margin = Padding.Empty
+        };
+        private readonly Label gainValue = Label("");
         private readonly Button install = Button("Set up Wi-Fi playback");
         private readonly Button start = Button("Start Wi-Fi cues");
         private readonly Button stop = Button("Stop Wi-Fi cues");
@@ -106,6 +120,16 @@ namespace PcOnSongBridge
             string savedIp = Host(preferences.WifiCueSourceAddress);
             tabletIp.Text = IsTabletIp(savedIp) ? savedIp : "";
             var outputLabel = Label("Windows output");
+            gain.Value = preferences.WifiCueGainDb >= gain.Minimum && preferences.WifiCueGainDb <= gain.Maximum
+                ? preferences.WifiCueGainDb : 0;
+            UpdateGain();
+            gain.ValueChanged += delegate
+            {
+                UpdateGain();
+                preferences.WifiCueGainDb = gain.Value;
+                try { preferences.Save(); }
+                catch (Exception ex) { SetStatus("Could not remember the cue gain. " + ex.Message); }
+            };
             vendor.LinkClicked += delegate
             {
                 try { Process.Start(new ProcessStartInfo("https://ndi.video/") { UseShellExecute = true }); }
@@ -113,7 +137,7 @@ namespace PcOnSongBridge
             };
             UpdateVoiceInfo();
             var sections = new Control[] { heading, directions, Row(sourceLabel, enterAddress), SelectRow(sources, find), addressRow, outputLabel, SelectRow(outputs, refreshOutputs),
-                setupInfo, Row(install, vendor), Row(start, stop), blocker, status, level, voiceInfo, Row(voice) };
+                Row(Label("NDI cue gain"), gain, gainValue), setupInfo, Row(install, vendor), Row(start, stop), blocker, status, level, voiceInfo, Row(voice) };
             foreach (var c in sections) layout.Controls.Add(c);
             layout.SizeChanged += delegate
             {
@@ -192,6 +216,12 @@ namespace PcOnSongBridge
                 "For Windows microphone commands over the network, open Wi-Fi voice control. You don’t need to wait for the stream search.";
         }
 
+        private void UpdateGain()
+        {
+            services.SetCueGain(gain.Value);
+            gainValue.Text = gain.Value.ToString("+0;-0;0") + " dB";
+        }
+
         private static string Host(string address)
         {
             if (String.IsNullOrWhiteSpace(address)) return "";
@@ -265,6 +295,7 @@ namespace PcOnSongBridge
         {
             bool idle = !closeRequested && current == Activity.Idle;
             bool otherAudio = !canPlay();
+            gain.Enabled = !closeRequested && current != Activity.Stopping;
             find.Enabled = sources.Enabled = outputs.Enabled = refreshOutputs.Enabled = idle;
             enterAddress.Enabled = tabletIp.Enabled = findAt.Enabled = idle;
             install.Visible = vendor.Visible = setupInfo.Visible = String.IsNullOrEmpty(runtime);
@@ -459,8 +490,14 @@ namespace PcOnSongBridge
                     s.LastSignalUtc != DateTime.MinValue ? "Ready for the next cue → " + destination + ". Last signal " + s.LastSignalUtc.ToLocalTime().ToString("T") + "." :
                     "Listening → " + destination + ". Tap an enabled song or section cue in OnSong.");
                 var measurements = new List<string>();
-                if (s.AudioFrames > 0) measurements.Add(String.Format("{0} Hz · {1} channels · {2}",
-                    s.SampleRate, s.Channels, s.Peak > 0 ? (20 * Math.Log10(s.Peak)).ToString("0") + " dBFS" : "Silence"));
+                if (s.AudioFrames > 0)
+                {
+                    measurements.Add(String.Format("{0} Hz · {1} channels · {2}", s.SampleRate, s.Channels,
+                        s.Peak > 0 ? "Input " + (20 * Math.Log10(s.Peak)).ToString("0.0") + " dBFS" : "Silence"));
+                    if (s.OutputPeak > 0)
+                        measurements.Add("Cue output " + (20 * Math.Log10(s.OutputPeak)).ToString("0.0") + " dBFS");
+                    if (s.OutputClipped) measurements.Add("Clipping — lower NDI cue gain");
+                }
                 if (s.DroppedAudioPackets > 0) measurements.Add(String.Format("{0:N0} NDI audio packets dropped at receiver", s.DroppedAudioPackets));
                 if (s.DroppedFrames > 0) measurements.Add(String.Format("{0:N0} output sample frames dropped", s.DroppedFrames));
                 level.Text = String.Join(" · ", measurements);

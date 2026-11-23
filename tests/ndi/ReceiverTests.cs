@@ -55,6 +55,7 @@ internal static class ReceiverTests
     private static void Main()
     {
         CheckConversion();
+        CheckGain();
         CheckSession();
         CheckSlowDriver(false);
         CheckSlowDriver(true);
@@ -155,6 +156,56 @@ internal static class ReceiverTests
         for (int i = 0; i < 48000; i++)
             total += converter.Convert(new NdiAudioBlock(48000, 1, input, input), out peak).Length / 2;
         Check(total == 44100, "Downsampling single-sample packets drifted.");
+    }
+
+    private static void CheckGain()
+    {
+        var input = new Capture { Online = true };
+        var output = new Playback();
+        var otherInput = new Capture { Online = true };
+        var otherOutput = new Playback();
+        using (var receiver = new NdiReceiver(s => input, e => output))
+        using (var other = new NdiReceiver(s => otherInput, e => otherOutput))
+        {
+            receiver.SetGainDb(6);
+            receiver.StartAsync(new NdiSource("Cue stream", ""), "band", CancellationToken.None).Wait();
+            other.StartAsync(new NdiSource("Other stream", ""), "band", CancellationToken.None).Wait();
+            var cue = new NdiAudioBlock(48000, 2, new[] { .25f, 0f }, new[] { -.125f, 0f });
+            input.Events.Add(cue);
+            otherInput.Events.Add(cue);
+            WaitFor(() => output.Writes.Count == 1 && otherOutput.Writes.Count == 1 && receiver.GetStatus().AudioFrames == 1,
+                "Missing gain-adjusted block.");
+            short[] scaled, unity;
+            Check(output.Writes.TryDequeue(out scaled) && scaled[0] == 16345 && scaled[1] == -8173 &&
+                scaled[2] == 0 && scaled[3] == 0, "Cue gain changed the stereo balance or amplified digital silence.");
+            Check(otherOutput.Writes.TryDequeue(out unity) && unity[0] == 8192 && unity[1] == -4096,
+                "One receiver's gain leaked into another playback stream.");
+            var status = receiver.GetStatus();
+            Check(status.Peak == .25 && Math.Abs(status.OutputPeak - .25 * Math.Pow(10, .3)) < .000001 && !status.OutputClipped,
+                "Incorrect source or post-gain peak.");
+            input.Events.Add(new NdiAudioBlock(48000, 2, new[] { .8f }, new[] { -.8f }));
+            WaitFor(() => receiver.GetStatus().OutputClipped && output.Writes.Count == 1, "Missing output clip indication.");
+            Check(output.Writes.TryDequeue(out scaled) && scaled[0] == 32767 && scaled[1] == -32768 &&
+                receiver.GetStatus().OutputPeak == 1, "Clipped output wrapped instead of saturating.");
+            receiver.SetGainDb(-6);
+            var steady = new float[480];
+            for (int i = 0; i < steady.Length; i++) steady[i] = .25f;
+            input.Events.Add(new NdiAudioBlock(48000, 1, steady, steady));
+            WaitFor(() => output.Writes.Count == 1, "Changing the live gain interrupted playback.");
+            Check(output.Writes.TryDequeue(out scaled) && scaled[0] > scaled[478] && scaled[0] < 16345 &&
+                scaled[478] == 4106 && scaled[479] == 4106 && scaled[scaled.Length - 1] == 4106,
+                "Gain change did not ramp to the intended level across both channels.");
+            receiver.StopAsync().Wait();
+            Check(!receiver.GetStatus().OutputClipped && receiver.GetStatus().OutputPeak == 0, "Stopped output meter remained active.");
+            foreach (int invalid in new[] { NdiReceiver.MinGainDb - 1, NdiReceiver.MaxGainDb + 1 })
+            {
+                bool rejected = false;
+                try { receiver.SetGainDb(invalid); }
+                catch (ArgumentOutOfRangeException) { rejected = true; }
+                Check(rejected, "Out-of-range NDI gain was accepted.");
+            }
+        }
+        Console.WriteLine("PASS NDI-only gain, source and output peaks, clip indication, bounds and live gain ramp.");
     }
 
     private static void CheckSession()

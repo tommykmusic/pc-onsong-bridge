@@ -27,6 +27,8 @@ namespace PcOnSongBridge
         public int SampleRate { get; internal set; }
         public int Channels { get; internal set; }
         public double Peak { get; internal set; }
+        public double OutputPeak { get; internal set; }
+        public bool OutputClipped { get; internal set; }
         public string Error { get; internal set; }
         public DateTime LastAudioUtc { get; internal set; }
         public DateTime LastSignalUtc { get; internal set; }
@@ -51,6 +53,7 @@ namespace PcOnSongBridge
 
     internal sealed class NdiReceiver : IDisposable
     {
+        internal const int MinGainDb = -24, MaxGainDb = 12;
         private readonly object gate = new object();
         private readonly string runtime;
         private readonly Func<NdiSource, INdiCapture> openCapture;
@@ -59,7 +62,14 @@ namespace PcOnSongBridge
         private CancellationTokenSource stop;
         private Task worker = Task.FromResult(true);
         private bool disposed;
-        private long peakAt;
+        private long peakAt, outputPeakAt, clipAt;
+        private volatile int gainDb;
+
+        public void SetGainDb(int value)
+        {
+            if (value < MinGainDb || value > MaxGainDb) throw new ArgumentOutOfRangeException("value");
+            gainDb = value;
+        }
 
         public NdiReceiver(string runtimeDllPath)
             : this(source => new NdiAudioInput(runtimeDllPath, source), endpoint => new Audio.NdiWaveOutput(endpoint))
@@ -100,7 +110,7 @@ namespace PcOnSongBridge
                 var lifetime = CancellationTokenSource.CreateLinkedTokenSource(token);
                 stop = lifetime;
                 status = new NdiReceiverStatus();
-                peakAt = 0;
+                peakAt = outputPeakAt = clipAt = 0;
                 worker = Task.Factory.StartNew(() => Run(source, endpointId, lifetime, started),
                     CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
                 return started.Task;
@@ -133,8 +143,8 @@ namespace PcOnSongBridge
                             lifetime.Token.ThrowIfCancellationRequested();
                             bool connected = input.Connected;
                             long nativeDrops = input.DroppedPackets;
-                            double peak = 0;
-                            int overflow = block == null ? 0 : pending.Add(converter.Convert(block, out peak));
+                            double peak = 0, outputPeak = 0;
+                            int overflow = block == null ? 0 : pending.Add(converter.Convert(block, gainDb, out peak, out outputPeak));
                             lock (gate)
                             {
                                 status.Connected = connected;
@@ -151,6 +161,9 @@ namespace PcOnSongBridge
                                     long now = Stopwatch.GetTimestamp();
                                     if (peak >= status.Peak || now - peakAt > Stopwatch.Frequency / 2)
                                     { status.Peak = peak; peakAt = now; }
+                                    if (outputPeak >= status.OutputPeak || now - outputPeakAt > Stopwatch.Frequency / 2)
+                                    { status.OutputPeak = Math.Min(1, outputPeak); outputPeakAt = now; }
+                                    if (outputPeak > 1) clipAt = now;
                                 }
                             }
                             // The NDI receiver reconnects to the selected source when it returns.
@@ -168,7 +181,7 @@ namespace PcOnSongBridge
             }
             finally
             {
-                lock (gate) { status.Running = false; status.Connected = false; status.Peak = 0; stop = null; }
+                lock (gate) { status.Running = false; status.Connected = false; status.Peak = status.OutputPeak = 0; clipAt = 0; stop = null; }
                 lifetime.Dispose();
             }
         }
@@ -232,7 +245,10 @@ namespace PcOnSongBridge
             lock (gate)
             {
                 var snapshot = status.Copy();
-                if (Stopwatch.GetTimestamp() - peakAt > Stopwatch.Frequency / 2) snapshot.Peak = 0;
+                long now = Stopwatch.GetTimestamp();
+                if (now - peakAt > Stopwatch.Frequency / 2) snapshot.Peak = 0;
+                if (now - outputPeakAt > Stopwatch.Frequency / 2) snapshot.OutputPeak = 0;
+                snapshot.OutputClipped = clipAt != 0 && now - clipAt < 2 * Stopwatch.Frequency;
                 return snapshot;
             }
         }

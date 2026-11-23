@@ -57,6 +57,8 @@ namespace PcOnSongBridge
         private readonly Button refresh = MakeButton("Refresh tablets");
         private readonly Button wifi = MakeButton("Wireless setup");
         private readonly Button wifiCues = MakeButton("Find my tablet", true);
+        private readonly Button midi = MakeButton("Wireless MIDI");
+        private WirelessMidiForm midiWindow;
         private readonly Label wifiSummary = Copy("Receive OnSong audio from an iPad or Android tablet on this network.", Secondary);
         private readonly Func<WifiCueServices> wifiServices;
         private WifiCuesForm wifiWindow;
@@ -159,6 +161,17 @@ namespace PcOnSongBridge
             refresh.Click += async delegate { await RefreshTabletsAsync(); };
             wifi.Click += async delegate { await OpenWirelessAsync(); };
             wifiCues.Click += delegate { OpenWifiCues(); };
+            midi.Click += delegate
+            {
+                if (midiWindow != null) { midiWindow.Activate(); return; }
+                midiWindow = new WirelessMidiForm(settings, input.SelectedItem as AudioDevice);
+                midiWindow.FormClosed += delegate
+                {
+                    midiWindow = null;
+                    if (closingAfterWifi) BeginInvoke(new Action(Close));
+                };
+                midiWindow.Show(this);
+            };
             start.Click += async delegate { await StartAsync(); };
             stop.Click += delegate { StopBridge(); };
             tone.Click += async delegate { await TestToneAsync(); };
@@ -242,8 +255,8 @@ namespace PcOnSongBridge
             header.Controls.Add(about, 2, 0);
             page.Controls.Add(header);
 
-            TableLayoutPanel wirelessCues = Card("Wi-Fi cues");
-            wirelessCues.Controls.Add(Buttons(wifiCues));
+            TableLayoutPanel wirelessCues = Card("Wi-Fi cues and MIDI");
+            wirelessCues.Controls.Add(Buttons(wifiCues, midi));
             wirelessCues.Controls.Add(wifiSummary);
             page.Controls.Add(wirelessCues);
 
@@ -419,6 +432,7 @@ namespace PcOnSongBridge
             buffer.Enabled = !busy && !streaming && !stopping;
             start.Enabled = selected && !streaming && idle && !stopping && (wifiWindow == null || !wifiWindow.PlaybackBusy);
             wifiCues.Enabled = !closing && !closingAfterWifi;
+            midi.Enabled = !closing && !closingAfterWifi;
             if (wifiWindow != null && !wifiWindow.IsDisposed) wifiWindow.RefreshAvailability();
             stop.Enabled = (streaming || startingAudio) && !stopping;
             refreshAudio.Enabled = !navigating && !tonePlaying;
@@ -1157,6 +1171,14 @@ namespace PcOnSongBridge
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             base.OnFormClosing(e);
+            if (midiWindow != null && !midiWindow.IsDisposed)
+            {
+                e.Cancel = true;
+                closingAfterWifi = true;
+                CancelNavigation();
+                midiWindow.Close();
+                return;
+            }
             if (wifiWindow != null && !wifiWindow.IsDisposed)
             {
                 e.Cancel = true;

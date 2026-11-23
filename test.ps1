@@ -2,7 +2,7 @@
 param([string]$ScrcpyArchive)
 
 $ErrorActionPreference = 'Stop'
-foreach ($suite in 'route','voice','command','swipe','transport','wireless','discovery','ndi','connect','setup','version') {
+foreach ($suite in 'route','voice','command','swipe','transport','wireless','discovery','midi','ndi','connect','setup','version') {
     Write-Output "Running $suite tests"
     & (Join-Path $PSScriptRoot "tests\$suite\run.ps1")
 }

@@ -23,9 +23,18 @@ namespace PcOnSongBridge
         private int previousRate;
         private float lastLeft, lastRight;
         private long next;
+        private double currentGain = 1, gainStep, targetGain = 1;
+        private int? lastGainDb;
+        private int rampFrames;
         internal NdiAudioConverter(int rate) { targetRate = rate; }
 
         internal short[] Convert(NdiAudioBlock frame, out double peak)
+        {
+            double outputPeak;
+            return Convert(frame, 0, out peak, out outputPeak);
+        }
+
+        internal short[] Convert(NdiAudioBlock frame, int gainDb, out double peak, out double outputPeak)
         {
             int count = frame.Left.Length;
             if (previousRate != frame.Rate)
@@ -37,15 +46,29 @@ namespace PcOnSongBridge
             long last = (long)(count - 1) * targetRate;
             int length = next > last ? 0 : (int)((last - next) / frame.Rate + 1);
             var pcm = new short[length * 2];
-            peak = 0;
+            if (lastGainDb != gainDb)
+            {
+                targetGain = Math.Pow(10, gainDb / 20.0);
+                // Start at the selected level. Smooth live adjustments over 5 ms to avoid a click.
+                if (lastGainDb == null) currentGain = targetGain;
+                else
+                {
+                    rampFrames = Math.Max(1, targetRate / 200);
+                    gainStep = (targetGain - currentGain) / rampFrames;
+                }
+                lastGainDb = gainDb;
+            }
+            peak = outputPeak = 0;
             for (int i = 0; i < pcm.Length; i += 2, next += frame.Rate)
             {
+                if (rampFrames > 0)
+                    currentGain = --rampFrames == 0 ? targetGain : currentGain + gainStep;
                 int right = (int)((next + targetRate - 1) / targetRate);
                 double weight = 1.0 - (right * (long)targetRate - next) / (double)targetRate;
                 float a = right == 0 ? lastLeft : frame.Left[right - 1];
                 float b = right == 0 ? lastRight : frame.Right[right - 1];
-                pcm[i] = Sample(a + (frame.Left[right] - a) * weight, ref peak);
-                pcm[i + 1] = Sample(b + (frame.Right[right] - b) * weight, ref peak);
+                pcm[i] = Sample(a + (frame.Left[right] - a) * weight, ref peak, ref outputPeak);
+                pcm[i + 1] = Sample(b + (frame.Right[right] - b) * weight, ref peak, ref outputPeak);
             }
             next -= (long)count * targetRate;
             lastLeft = frame.Left[count - 1];
@@ -53,12 +76,13 @@ namespace PcOnSongBridge
             return pcm;
         }
 
-        private static short Sample(double value, ref double peak)
+        private short Sample(double value, ref double peak, ref double outputPeak)
         {
             if (Double.IsNaN(value)) return 0;
-            value = Math.Max(-1, Math.Min(1, value));
-            peak = Math.Max(peak, Math.Abs(value));
-            return (short)Math.Max(-32768, Math.Min(32767, Math.Round(value * 32768)));
+            peak = Math.Max(peak, Math.Min(1, Math.Abs(value)));
+            double scaled = value * currentGain;
+            outputPeak = Math.Max(outputPeak, Math.Abs(scaled));
+            return (short)Math.Max(-32768, Math.Min(32767, Math.Round(scaled * 32768)));
         }
     }
 

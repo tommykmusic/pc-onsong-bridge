@@ -9,6 +9,7 @@ The beta installer is unsigned. If your browser says it’s uncommon, check that
 | What has been tested | What to expect in this beta |
 | --- | --- |
 | Cue audio over Wi-Fi | A TCL Android tablet running OnSong Premium sent song and section cues over NDI® to the selected Windows speakers. A physical iPad and the X32-to-IEM route still need a soundcheck. [NDI](https://ndi.video/) |
+| Voice control over wireless MIDI (v0.10.0) | With Android wireless debugging off, a musician used the laptop mic to advance and return on the TCL. Both spoken cues reached the laptop over NDI. |
 | Cue audio and voice control over Android USB | A TCL tablet played cues through Windows. A musician using the laptop mic changed songs and scrolled the chart. Other OnSong actions can be assigned to shortcuts. |
 | Voice control over native OnSong Connect Wi-Fi | The tablet paired and allowed chart reads. OnSong 2026.5 for Android rejected chart writes during the physical trial. Next, previous and scroll have passed against a simulated tablet. |
 
@@ -28,13 +29,22 @@ The beta installer is unsigned. If your browser says it’s uncommon, check that
 4. If the list is empty, start another search and tap **Stop Streaming**, then **Go Live** on the tablet. For a network that filters discovery announcements, use **Enter tablet address** with the tablet’s Wi-Fi IPv4 address. The bridge looks up the correct streaming port. After a verified connection it remembers the tablet and output for the next soundcheck.
 5. When finished, click **Stop Wi-Fi cues** on Windows and **Stop Streaming** on the tablet. Other receivers on the local network can see the selected projection and hear the main mix while OnSong is live. [OnSong Live Streaming](https://onsongapp.com/docs/interface/menubar/external-video-menu/livestream/)
 
+### Wireless MIDI song control and independent cue level (v0.10.0)
+
+On the same band network, the bridge can send next and previous song directly to OnSong over network MIDI. NDI carries OnSong's audio back to Windows. These paths work with Android wireless debugging off.
+
+1. In OnSong Premium, open **Utilities → Editors → MIDI**. In its MIDI settings, turn on **MIDI Enabled** and **Network Session**. In the bridge’s main window choose **Wireless MIDI**, select the advertised tablet and click **Connect**. Windows speech, MIDI and NDI can use the same laptop without an extra MIDI driver or developer key.
+2. For first-time setup, leave OnSong's **MIDI Triggers** screen open. In the bridge click **Next song** once. Tap the new controller row on the tablet and assign **Navigation → Song → Next**. Repeat with **Previous song → Navigation → Song → Previous**. The defaults are channel 16, control changes 110 and 111, value 127. If a controller is already assigned, choose an unused number in the bridge. [OnSong MIDI triggers](https://onsongapp.com/docs/interface/menubar/utilities-menu/editors/midi/triggers/)
+3. Return to a chart in a set. Choose the command microphone in **Wireless MIDI** and press **Start listening** once. Say “next song,” then “previous song.” **Stop listening** releases the mic. The main window's **Require standalone commands** setting applies when listening starts. The MIDI activity log measures time from the detected end of speech to sending the message. Watch the chart to confirm movement.
+4. Keep the Wi-Fi cue receiver open alongside MIDI. Its **NDI cue gain** starts at 0 dB. Raise it in small steps while checking **Cue output**. If clipping appears, lower the gain. This slider affects all audio in OnSong’s NDI mix, including any tablet backing tracks. Spotify playing on the PC keeps its own Windows app level. For independent stage faders, send the bridge and Spotify to different X32 returns.
+
 ### Optional components in the installer
 
 On a first install, **Choose optional components after installation** is selected. Choose **Wi-Fi cue audio** to open the NDI runtime wizard, **Android USB cues and controls** to install the verified scrcpy package with ADB, or **Voice commands** to open Windows language settings if an English desktop recognizer is missing. Choose **Set up selected**. Components already available appear as **Ready**. You can use **Open bridge** or **Finish** to proceed without downloading tools, or run the installer again to add a component later.
 
-### Wireless voice control (experimental — developer key required)
+### OnSong Connect voice control (experimental)
 
-> **Status:** For working voice commands today, use **Android USB or wireless debugging** below. Native OnSong Connect Wi-Fi voice control requires an OnSong-issued developer key, and OnSong 2026.5 for Android currently returns HTTP 401 on chart changes.
+> For next and previous song over the local network, use **Wireless MIDI** in v0.10.0. The separate **Wi-Fi voice control** window uses OnSong Connect and requires an OnSong-issued developer key. During the TCL test, OnSong 2026.5 for Android returned HTTP 401 on chart changes through that window.
 
 **Wi-Fi voice control** uses OnSong Connect in OnSong 2026 or later. It works with USB unplugged and tablet streaming off. On the PC, open **Find my tablet → Wi-Fi voice control**. The bridge fills in the selected stream’s address or the last saved tablet address. You can also enter the tablet’s Wi-Fi address yourself.
 
@@ -94,6 +104,10 @@ For a named target, map a phrase such as “go to Amazing Grace” to **Song →
 ## Optional network connection and tablet power
 
 ### Wi-Fi soundcheck results
+
+On the installed v0.10.0 build, one hands-free trial on a TCL with wireless debugging off measured time from the recognizer’s detected end of each phrase. The bridge sent the MIDI message in 554 ms for “next song” and 579 ms for “previous song.” The first NDI cue audio arrived at the laptop in 676 ms and 717 ms respectively. Polling OnSong confirmed the new chart by 1.35 s and the original chart by 1.19 s. The musician confirmed both movements on the tablet and heard both cues. These timings describe one round trip through the set. The physical display was observed by eye.
+
+Raising **NDI cue gain** from 0 to +1 dB raised the measured Windows playback peaks from −1.57 to −0.57 dBFS for the next-song cue and from −3.56 to −2.56 dBFS for the previous-song cue. Both remained below clipping. The Windows master and Spotify volume settings stayed fixed. Spotify was paused for the comparison.
 
 On a TCL Android tablet running OnSong 2026.5, the bridge found the projection by name and received 48 kHz stereo cues. One integrated trial moved to the next song, selected a section and returned to the starting song. Windows independently measured three audio bursts from the bridge process on the chosen Realtek speaker endpoint. From the start of each tablet action to the first Windows meter reading above −60 dBFS, the respective times were approximately 0.62 s, 0.50 s and 0.22 s. USB automated the taps and keyboard shortcuts for repeatability. Wi-Fi carried the audio. Speaker acoustics, microphone recognition, an iPad and the X32 were outside that measurement.
 

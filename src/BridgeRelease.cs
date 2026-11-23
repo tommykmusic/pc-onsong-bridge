@@ -8,6 +8,6 @@ namespace PcOnSongBridge
 {
     internal static class BridgeRelease
     {
-        internal const string Version = "0.9.2";
+        internal const string Version = "0.10.0";
     }
 }

@@ -17,9 +17,14 @@ namespace PcOnSongBridge
         public string WifiCueSource { get; set; }
         public string WifiCueSourceAddress { get; set; }
         public string WifiCueOutputEndpointId { get; set; }
+        public int WifiCueGainDb { get; set; }
         public int BufferMs { get; set; }
         public bool KeyboardMode { get; set; }
         public bool StandaloneCommandsOnly { get; set; }
+        public string MidiPeerName { get; set; }
+        public int MidiChannel { get; set; }
+        public int MidiNextController { get; set; }
+        public int MidiPreviousController { get; set; }
         public TabletControlMode? ControlMode { get; set; }
         public List<VoiceBinding> VoiceBindings { get; set; }
 
@@ -27,6 +32,9 @@ namespace PcOnSongBridge
         {
             BufferMs = 75;
             StandaloneCommandsOnly = true;
+            MidiChannel = 16;
+            MidiNextController = 110;
+            MidiPreviousController = 111;
             VoiceBindings = new List<VoiceBinding>();
         }
 
