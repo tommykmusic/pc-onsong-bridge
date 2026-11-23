@@ -31,7 +31,8 @@ namespace PcOnSongBridge
         private bool listening, closing, inputsUnavailable;
 
         internal ConnectVoiceForm(string tabletAddress, AudioDevice selectedMicrophone, ConnectKeyStore keyStore = null,
-            HandsFreeSession listenSession = null, Func<string, ConnectKeyStore, ConnectSession> openSession = null)
+            HandsFreeSession listenSession = null, Func<string, ConnectKeyStore, ConnectSession> openSession = null,
+            Preferences preferences = null)
         {
             Text = "Wi-Fi voice control";
             AutoScaleMode = AutoScaleMode.Dpi;
@@ -44,7 +45,7 @@ namespace PcOnSongBridge
             MinimumSize = new Size(540, 430);
             ClientSize = new Size(588, 468);
             keyStore = keyStore ?? new ConnectKeyStore();
-            listenSession = listenSession ?? Audio.ListenHandsFreeAsync;
+            preferences = preferences ?? Preferences.Load();
             openSession = openSession ?? ConnectSession.Open;
             keyAvailable = ConnectSession.ConfiguredKey(keyStore) != null;
             var panel = new TableLayoutPanel { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(18), ColumnCount = 1 };
@@ -135,7 +136,8 @@ namespace PcOnSongBridge
                     return;
                 }
                 listening = true;
-                await Run(token => Listen(listenSession, token));
+                bool standalone = preferences.StandaloneCommandsOnly;
+                await Run(token => Listen(listenSession ?? Audio.HandsFreeSessionFor(standalone), standalone, token));
             };
             status.Text = InitialStatus();
             UpdateEnabled();
@@ -224,9 +226,10 @@ namespace PcOnSongBridge
             return !closing && !IsDisposed && listening && operation != null && operation.Token == token && !token.IsCancellationRequested;
         }
 
-        private Task Listen(HandsFreeSession run, CancellationToken token)
+        private Task Listen(HandsFreeSession run, bool standalone, CancellationToken token)
         {
-            const string readyHint = "Listening for next song, previous song, scroll up and scroll down.";
+            string readyHint = "Listening for next song, previous song, scroll up and scroll down." +
+                (standalone ? " Speak each command by itself." : "");
             SetSpeechHint("Opening the command microphone…");
             status.Text = "";
             return run((AudioDevice)microphone.SelectedItem, recognizer, commands,

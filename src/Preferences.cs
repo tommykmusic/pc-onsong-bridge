@@ -19,12 +19,14 @@ namespace PcOnSongBridge
         public string WifiCueOutputEndpointId { get; set; }
         public int BufferMs { get; set; }
         public bool KeyboardMode { get; set; }
+        public bool StandaloneCommandsOnly { get; set; }
         public TabletControlMode? ControlMode { get; set; }
         public List<VoiceBinding> VoiceBindings { get; set; }
 
         public Preferences()
         {
             BufferMs = 75;
+            StandaloneCommandsOnly = true;
             VoiceBindings = new List<VoiceBinding>();
         }
 

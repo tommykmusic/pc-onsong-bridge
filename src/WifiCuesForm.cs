@@ -168,7 +168,7 @@ namespace PcOnSongBridge
             {
                 var source = sources.SelectedItem as NdiSource;
                 string address = VoiceAddress(source, tabletIp.Text, preferences.WifiCueSourceAddress);
-                using (var dialog = new ConnectVoiceForm(address, microphone())) dialog.ShowDialog(this);
+                using (var dialog = new ConnectVoiceForm(address, microphone(), preferences: preferences)) dialog.ShowDialog(this);
                 UpdateVoiceInfo();
             };
             Shown += async delegate

@@ -58,6 +58,7 @@ internal static class LatencyTests
             CheckSingleCommand(next, previous, recognizer, ids);
             CheckFailedSource(recognizer, ids);
             CompareHandsFreeEndpoints(synth, recognizer);
+            CompareStandaloneTiming(synth, recognizer);
             using (var stop = new CancellationTokenSource(150))
             {
                 var elapsed = Stopwatch.StartNew();
@@ -85,6 +86,7 @@ internal static class LatencyTests
         if (delay >= 800) throw new InvalidOperationException("Live recognition waited for the fixed capture window.");
         CheckHandsFree(synth, recognizer);
         CheckHandsFreePrefixesAndRepeats(synth, recognizer);
+        CheckStandaloneTalkback(synth, recognizer);
         CheckHandsFreeInputFailure(Say(synth, "next song"), recognizer);
     }
 
@@ -149,7 +151,7 @@ internal static class LatencyTests
         var grammar = VoiceCommands.ForMode(TabletControlMode.Automatic, new[] { longer }).ToArray();
         var audio = new List<byte>(new byte[600 * 32]);
         var ends = new List<double>();
-        audio.AddRange(Say(synth, "the guitar comes in after the next chorus"));
+        audio.AddRange(Say(synth, "the guitar comes in after the next song"));
         audio.AddRange(new byte[800 * 32]);
         audio.AddRange(Say(synth, "next song"));
         audio.AddRange(new byte[200 * 32]);
@@ -162,46 +164,113 @@ internal static class LatencyTests
             ends.Add(audio.Count / 32.0);
             audio.AddRange(new byte[420 * 32]);
         }
-        var delays = CheckContinuousSequence(recognizer, grammar, audio.ToArray(), ends,
-            new[] { longer.Id, "previous", "previous" }, true);
-        if (delays.Any(d => d < 0 || d > 1300))
-            throw new InvalidOperationException("Early, duplicate, or late hands-free command around a prefix or repeat.");
-        Console.WriteLine("PASS continuous room noise, unrelated talkback containing song words, a paused mapped prefix and consecutive previous commands.");
+        var repeats = audio.ToArray();
+        var followedByTalkback = repeats.Concat(Say(synth, "the guitar comes in after the next song")).ToArray();
+        Action<byte[], bool, bool> checkRepeats = (pcm, fast, allowMissingFinalRepeat) =>
+        {
+            var delays = CheckContinuousSequence(recognizer, grammar, pcm, ends,
+                new[] { longer.Id, "previous", "previous" }, true,
+                verifySongEndpoints: fast, standaloneCommandsOnly: true, allowMissingFinalRepeat: allowMissingFinalRepeat);
+            if (delays.Any(d => d < 0 || d > 1300))
+                throw new InvalidOperationException("Early, duplicate, or late hands-free command around a prefix or repeat.");
+        };
+        checkRepeats(repeats, false, false);
+        checkRepeats(followedByTalkback, true, false);
+        // With early verification forced off, Windows can merge the last repeat and the
+        // following sentence. Reject that uncertain repeat and never send the embedded "next".
+        checkRepeats(followedByTalkback, false, true);
+        Console.WriteLine("PASS standalone mode ignores an embedded command in room noise, accepts a paused mapped phrase and two consecutive previous commands.");
     }
 
     private static List<double> CheckContinuousSequence(RecognizerInfo recognizer, VoiceCommand[] grammar,
-        byte[] pcm, List<double> ends, string[] expected, bool noise, bool verifySongEndpoints = true)
+        byte[] pcm, List<double> ends, string[] expected, bool noise, bool verifySongEndpoints = true,
+        bool standaloneCommandsOnly = false, bool allowMissingFinalRepeat = false)
     {
         var received = new List<string>();
         var delays = new List<double>();
         int opens = 0, ready = 0;
         long origin = 0;
-        using (var stop = new CancellationTokenSource(TimeSpan.FromSeconds(22)))
+        using (var stop = new CancellationTokenSource(TimeSpan.FromMilliseconds(pcm.Length / 32 + 10000)))
         {
+            bool playedToEnd = false;
             try
             {
                 Task.Run(() => Audio.RunHandsFreeInputAsync(recognizer, grammar, (accept, start, token) =>
                 {
                     Interlocked.Increment(ref opens);
-                    Pace(pcm, pcm.Length / 32 + 1800, accept, token, 48000, 2, 1, noise, t =>
+                    Pace(pcm, pcm.Length / 32 + 1200, accept, token, 48000, 2, 1, noise, t =>
                     {
                         origin = t;
                         start(t);
                     });
+                    // Keep listening after the last expected event to catch delayed finals and false commands.
+                    playedToEnd = true;
+                    stop.Cancel();
                 }, () => ready++, (result, token) =>
                 {
                     int i = received.Count;
                     received.Add(result.Command);
                     if (i < ends.Count) delays.Add((Stopwatch.GetTimestamp() - origin) * 1000.0 / Stopwatch.Frequency - ends[i]);
-                    if (received.Count == ends.Count) stop.Cancel();
                     return Task.FromResult(0);
-                }, unmatched => { }, stop.Token, verifySongEndpoints)).GetAwaiter().GetResult();
+                }, unmatched => { }, stop.Token, verifySongEndpoints, standaloneCommandsOnly)).GetAwaiter().GetResult();
             }
             catch (OperationCanceledException) { if (!stop.IsCancellationRequested) throw; }
+            if (!playedToEnd) throw new InvalidOperationException("Continuous replay timed out before the last audio block.");
         }
-        if (opens != 1 || ready != 1 || !received.SequenceEqual(expected))
+        bool missingLastOnly = allowMissingFinalRepeat && received.SequenceEqual(expected.Take(expected.Length - 1));
+        if (opens != 1 || ready != 1 || (!received.SequenceEqual(expected) && !missingLastOnly))
             throw new InvalidOperationException("Continuous recognition returned unexpected commands: " + String.Join(", ", received));
         return delays;
+    }
+
+    private static void CheckStandaloneTalkback(SpeechSynthesizer synth, RecognizerInfo recognizer)
+    {
+        var commands = VoiceCommands.ForMode(TabletControlMode.FastSongShortcuts, null).ToArray();
+        var audio = new List<byte>(new byte[600 * 32]);
+        var ends = new List<double>();
+        var expected = new[] { "next", "previous", "scroll-down" };
+        foreach (var phrase in new[] { "the guitar comes in after the next song", "next song", "previous song",
+            "next song starts with the bass", "scroll down", "the guitar comes in after the next song" })
+        {
+            audio.AddRange(Say(synth, phrase));
+            if (commands.Any(c => c.Phrase == phrase)) ends.Add(audio.Count / 32.0);
+            audio.AddRange(new byte[750 * 32]);
+        }
+        foreach (bool fast in new[] { true, false })
+        {
+            var delays = CheckContinuousSequence(recognizer, commands, audio.ToArray(), ends, expected, false,
+                verifySongEndpoints: fast, standaloneCommandsOnly: true);
+            if (delays.Any(d => d < 0 || d > 1000))
+                throw new InvalidOperationException("Standalone mode dispatched outside an intentional command's timing window.");
+        }
+        Console.WriteLine("PASS standalone commands before and after incidental talkback using both early verification and Windows final recognition.");
+    }
+
+    private static void CompareStandaloneTiming(SpeechSynthesizer synth, RecognizerInfo recognizer)
+    {
+        var grammar = VoiceCommands.ForMode(TabletControlMode.FastSongShortcuts, null).ToArray();
+        var audio = new List<byte>(new byte[600 * 32]);
+        var ends = new List<double>();
+        var ids = new[] { "next", "previous", "next", "previous", "next", "previous" };
+        foreach (string id in ids)
+        {
+            audio.AddRange(Say(synth, grammar.Single(c => c.Id == id).Phrase));
+            ends.Add(audio.Count / 32.0);
+            audio.AddRange(new byte[700 * 32]);
+        }
+        var pcm = audio.ToArray();
+        var off = CheckContinuousSequence(recognizer, grammar, pcm, ends, ids, true);
+        var on = CheckContinuousSequence(recognizer, grammar, pcm, ends, ids, true, standaloneCommandsOnly: true);
+        if (off.Any(d => d < 0) || on.Any(d => d < 0))
+            throw new InvalidOperationException("The listener dispatched before the command ended.");
+        foreach (string id in ids.Distinct())
+        {
+            double before = off.Where((d, i) => ids[i] == id).OrderBy(d => d).ElementAt(1);
+            double after = on.Where((d, i) => ids[i] == id).OrderBy(d => d).ElementAt(1);
+            Console.WriteLine("Standalone mode acoustic end to dispatch for {0}: off {1:0} ms, on {2:0} ms (3 matched trials per setting).", id, before, after);
+            if (after - before > 60)
+                throw new InvalidOperationException("Standalone mode added more than three 20 ms capture blocks.");
+        }
     }
 
     private static void CompareHandsFreeEndpoints(SpeechSynthesizer synth, RecognizerInfo recognizer)

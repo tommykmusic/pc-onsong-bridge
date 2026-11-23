@@ -36,6 +36,11 @@ namespace PcOnSongBridge
         private readonly ComboBox navigation = Picker();
         private readonly NumericUpDown buffer = new NumericUpDown();
         private readonly CheckBox hotkey = new CheckBox();
+        private readonly CheckBox standalone = new CheckBox
+        {
+            Text = "Require standalone commands", AutoSize = true,
+            AccessibleDescription = "During continuous listening, speak the command as a phrase by itself."
+        };
         private readonly Label status = new Label();
         private readonly Label tabletHelp = Copy("", Secondary);
         private readonly Label route = Copy("Start cue audio to check the Windows output.", Secondary);
@@ -132,6 +137,7 @@ namespace PcOnSongBridge
             hotkey.AutoSize = true;
             hotkey.Margin = new Padding(12, 6, 4, 2);
             hotkey.ForeColor = Secondary;
+            standalone.Checked = settings.StandaloneCommandsOnly;
             status.TextAlign = ContentAlignment.MiddleRight;
             status.Dock = DockStyle.Fill;
             status.Font = new Font(Font, FontStyle.Bold);
@@ -164,6 +170,11 @@ namespace PcOnSongBridge
             next.Click += async delegate { await NavigateAsync("next"); };
             listen.Click += async delegate { await NavigateAsync(null); };
             hotkey.CheckedChanged += delegate { SetHotkey(hotkey.Checked); };
+            standalone.CheckedChanged += delegate
+            {
+                settings.StandaloneCommandsOnly = standalone.Checked;
+                SavePreferences();
+            };
             devices.SelectedIndexChanged += delegate
             {
                 if (Serial != null)
@@ -258,6 +269,7 @@ namespace PcOnSongBridge
             voice.Controls.Add(LabeledRow("Tablet control", navigation, verify));
             voice.Controls.Add(Buttons(testCommands, previous, next));
             voice.Controls.Add(Buttons(listen, hotkey));
+            voice.Controls.Add(standalone);
             voice.Controls.Add(speechStatus);
             voice.Controls.Add(activity);
             page.Controls.Add(voice);
@@ -422,6 +434,7 @@ namespace PcOnSongBridge
             bool speechAvailable = recognizer != null || liveVoice != null;
             bool stoppingListener = listening && navigationOperation.IsCancellationRequested;
             hotkey.Enabled = speechAvailable;
+            standalone.Enabled = !listening;
             listen.Enabled = listening ? !stoppingListener : canNavigate && speechAvailable && input.SelectedItem != null && !tonePlaying;
             listen.Text = stoppingListener ? "Stopping…" : listening ? "Stop listening" : "Start listening";
             speechStatus.ForeColor = listening ? Accent : Secondary;
@@ -973,8 +986,10 @@ namespace PcOnSongBridge
                     await SendNavigationAsync(serial, commands.First(item => item.Id == command), mode, null, token);
                     return;
                 }
-                HandsFreeSession run = liveVoice ?? Audio.ListenHandsFreeAsync;
-                activity.Text = "Say a ready phrase from the command library.";
+                HandsFreeSession run = liveVoice ?? Audio.HandsFreeSessionFor(settings.StandaloneCommandsOnly);
+                activity.Text = settings.StandaloneCommandsOnly
+                    ? "Say a command by itself, such as “next song.”"
+                    : "Say a ready phrase from the command library.";
                 await run((AudioDevice)input.SelectedItem, recognizer, commands,
                     delegate
                     {

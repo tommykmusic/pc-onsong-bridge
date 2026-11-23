@@ -89,6 +89,9 @@ internal static class UiTests
     private static async Task ExerciseTalkback(Control[] controls, TalkbackMicrophone mic, string dir)
     {
         var listen = controls.OfType<Button>().Single(b => b.Text == "Start listening");
+        var standalone = controls.OfType<CheckBox>().Single(b => b.Text == "Require standalone commands");
+        if (!standalone.Checked || !standalone.Enabled)
+            throw new Exception("Standalone command protection should initially be selected and adjustable.");
         var refresh = controls.OfType<Button>().Single(b => b.Text == "Refresh tablets");
         var verify = controls.OfType<Button>().Single(b => b.Text == "Check navigation");
         var micRow = (TableLayoutPanel)controls.OfType<Label>().Single(l => l.Text == "Microphone").Parent;
@@ -115,6 +118,7 @@ internal static class UiTests
         int baseline = File.Exists(trace) ? File.ReadAllLines(trace).Length : 0;
         listen.PerformClick();
         await Until(() => listen.Enabled && listen.Text == "Stop listening" && mic.Opens == 1, "latched microphone");
+        if (standalone.Enabled) throw new Exception("The command boundary setting changed while the microphone was armed.");
         mic.NoMatch(new MicrophoneResult(Double.NegativeInfinity, null));
         await mic.Say("next");
         mic.NoMatch(new MicrophoneResult(-18, null));
@@ -136,8 +140,14 @@ internal static class UiTests
         try { await mic.Say("next"); } catch (OperationCanceledException) { }
         mic.Closed.SetResult(true);
         await Until(() => listen.Text == "Start listening" && listen.Enabled, "microphone released");
+        if (!standalone.Enabled) throw new Exception("Stopping capture did not unlock the command boundary setting.");
+        standalone.Checked = false;
+        if (Preferences.Load(Path.Combine(dir, "settings.xml")).StandaloneCommandsOnly)
+            throw new Exception("Turning off standalone commands did not survive a settings reload.");
         listen.PerformClick();
         await Until(() => mic.Opens == 2 && listen.Text == "Stop listening", "second listening session");
+        if (standalone.Enabled || standalone.Checked)
+            throw new Exception("A new listening session lost the saved opt-out.");
         string holdReply = Path.Combine(dir, "hold-navigation-reply");
         File.WriteAllText(holdReply, "");
         Task sending = mic.Say("next");
@@ -475,6 +485,8 @@ internal static class UiTests
         // Supply a v0.1.0-style file without the new endpoint element.
         File.WriteAllText(settingsPath, "<Preferences><BufferMs>75</BufferMs><Serial>READY123</Serial></Preferences>");
         Preferences settings = Preferences.Load(settingsPath);
+        if (!settings.StandaloneCommandsOnly || !new Preferences().StandaloneCommandsOnly)
+            throw new Exception("Standalone commands should be enabled for new and pre-option preferences.");
         settings.ScrcpyPath = Path.Combine(dir, "scrcpy.exe");
         WriteSilentWave(Path.Combine(dir, "silence.wav"));
         Application.EnableVisualStyles();

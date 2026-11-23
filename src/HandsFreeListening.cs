@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.ExceptionServices;
+using System.Runtime.InteropServices;
 using System.Speech.AudioFormat;
 using System.Speech.Recognition;
 using System.Threading;
@@ -37,19 +38,26 @@ namespace PcOnSongBridge
         internal delegate void OpenSpeechInput(Func<byte[], uint, ushort, bool> accept, Action<long> started, CancellationToken token);
         private static int handsFreeActive;
 
-        internal static Task ListenHandsFreeAsync(AudioDevice device, RecognizerInfo recognizer, VoiceCommand[] commands,
-            Action ready, Func<MicrophoneResult, CancellationToken, Task> dispatch, Action<MicrophoneResult> noMatch, CancellationToken token)
+        internal static HandsFreeSession HandsFreeSessionFor(bool standaloneCommandsOnly)
+        {
+            return (device, recognizer, commands, ready, dispatch, noMatch, token) =>
+                ListenHandsFreeAsync(device, recognizer, commands, ready, dispatch, noMatch, token, standaloneCommandsOnly);
+        }
+
+        private static Task ListenHandsFreeAsync(AudioDevice device, RecognizerInfo recognizer, VoiceCommand[] commands,
+            Action ready, Func<MicrophoneResult, CancellationToken, Task> dispatch, Action<MicrophoneResult> noMatch,
+            CancellationToken token, bool standaloneCommandsOnly)
         {
             return RunHandsFreeInputAsync(recognizer, commands, (accept, started, cancel) =>
             {
                 VerifyDevice(device, true);
                 CaptureBlocks(device, Timeout.Infinite, accept, cancel, null, started);
-            }, ready, dispatch, noMatch, token);
+            }, ready, dispatch, noMatch, token, standaloneCommandsOnly: standaloneCommandsOnly);
         }
 
         internal static async Task RunHandsFreeInputAsync(RecognizerInfo recognizer, VoiceCommand[] commands, OpenSpeechInput open,
             Action ready, Func<MicrophoneResult, CancellationToken, Task> dispatch, Action<MicrophoneResult> noMatch, CancellationToken token,
-            bool verifySongEndpoints = true)
+            bool verifySongEndpoints = true, bool standaloneCommandsOnly = false)
         {
             token.ThrowIfCancellationRequested();
             if (Interlocked.CompareExchange(ref handsFreeActive, 1, 0) != 0)
@@ -62,7 +70,7 @@ namespace PcOnSongBridge
                     var opened = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
                     var worker = Task.Run(() =>
                     {
-                        try { RecognizeHandsFree(recognizer, commands, open, opened, results, lifetime, verifySongEndpoints); }
+                        try { RecognizeHandsFree(recognizer, commands, open, opened, results, lifetime, verifySongEndpoints, standaloneCommandsOnly); }
                         finally { results.CompleteAdding(); }
                     });
                     Exception failure = null;
@@ -105,17 +113,18 @@ namespace PcOnSongBridge
 
         private static void RecognizeHandsFree(RecognizerInfo recognizer, VoiceCommand[] commands, OpenSpeechInput open,
             TaskCompletionSource<bool> opened, BlockingCollection<MicrophoneResult> results, CancellationTokenSource lifetime,
-            bool verifySongEndpoints)
+            bool verifySongEndpoints, bool standaloneCommandsOnly)
         {
             var token = lifetime.Token;
             using (var engine = new SpeechRecognitionEngine(recognizer))
+            using (var verifier = standaloneCommandsOnly ? OpenStandaloneVerifier(recognizer, commands) : null)
             using (var input = new TalkbackStream())
             using (var stopInput = CancellationTokenSource.CreateLinkedTokenSource(token))
             using (var completed = new ManualResetEventSlim())
             {
                 long firstSample = 0;
                 Exception failure = null;
-                engine.LoadGrammar(BuildCommandGrammar(recognizer, commands));
+                LoadTalkbackGrammars(engine, recognizer, commands, standaloneCommandsOnly);
                 engine.InitialSilenceTimeout = TimeSpan.Zero;
                 engine.EndSilenceTimeout = TimeSpan.FromMilliseconds(120);
                 engine.EndSilenceTimeoutAmbiguous = TimeSpan.FromMilliseconds(PrefixPauseMilliseconds);
@@ -126,21 +135,20 @@ namespace PcOnSongBridge
                     if (!results.TryAdd(result) && result.Command != null)
                         throw new InvalidOperationException("Tablet control fell behind the microphone. Check the connection and start listening again.");
                 };
-                var fast = new SongEndpoint(recognizer, commands, input, publish, token);
-                if (verifySongEndpoints)
-                {
+                var fast = new SongEndpoint(recognizer, commands, input, publish, token, verifier);
+                if (verifySongEndpoints || verifier != null)
                     engine.SpeechDetected += (sender, e) => fast.Begin(e.AudioPosition);
+                if (verifySongEndpoints && (!standaloneCommandsOnly || verifier != null))
                     engine.SpeechHypothesized += (sender, e) => fast.Hypothesis(e.Result.Text);
-                }
                 Action<RecognitionResult, bool> heard = (speech, accepted) =>
                 {
                     if (stopInput.IsCancellationRequested) return;
                     try
                     {
                         double peak = SpeechPeak(speech);
-                        var result = accepted ? AcceptedResult(speech, commands, peak, Interlocked.Read(ref firstSample)) :
+                        var result = accepted ? AcceptedTalkbackResult(speech, commands, peak, Interlocked.Read(ref firstSample), standaloneCommandsOnly) :
                             new MicrophoneResult(peak, null);
-                        fast.Finish(result);
+                        fast.Finish(result, speech == null ? null : speech.Audio, Interlocked.Read(ref firstSample));
                     }
                     catch (Exception error)
                     {
@@ -197,6 +205,47 @@ namespace PcOnSongBridge
             }
         }
 
+        private static void LoadTalkbackGrammars(SpeechRecognitionEngine engine, RecognizerInfo recognizer,
+            VoiceCommand[] commands, bool standaloneCommandsOnly)
+        {
+            engine.LoadGrammar(BuildCommandGrammar(recognizer, commands));
+            if (!standaloneCommandsOnly) return;
+            // Give the decoder a way to explain speech on either side of a command. A low relative
+            // weight lets the literal grammar win when the competing evidence is just room noise.
+            var talkback = BuildCommandGrammar(recognizer, commands, allowSurroundingSpeech: true);
+            talkback.Weight = 0.02f;
+            engine.LoadGrammar(talkback);
+        }
+
+        private static MicrophoneResult AcceptedTalkbackResult(RecognitionResult speech, VoiceCommand[] commands,
+            double peak, long origin, bool standaloneCommandsOnly)
+        {
+            var result = AcceptedResult(speech, commands, peak, origin);
+            // In the wildcard grammar the command still has the same semantic ID. Its displayed
+            // words include any surrounding speech, which disqualifies that utterance for dispatch.
+            if (standaloneCommandsOnly && result.Command != null && !commands.Any(c => c.Id == result.Command &&
+                c.Phrase.Equals(speech.Text, StringComparison.OrdinalIgnoreCase)))
+                return new MicrophoneResult(peak, null);
+            return result;
+        }
+
+        private static SpeechRecognitionEngine OpenStandaloneVerifier(RecognizerInfo recognizer, VoiceCommand[] commands)
+        {
+            SpeechRecognitionEngine engine = null;
+            try
+            {
+                engine = new SpeechRecognitionEngine(recognizer);
+                LoadTalkbackGrammars(engine, recognizer, commands, true);
+                engine.InitialSilenceTimeout = TimeSpan.FromMilliseconds(CaptureMilliseconds(commands));
+                var ready = engine;
+                engine = null;
+                return ready;
+            }
+            catch (InvalidOperationException) { return null; }
+            catch (COMException) { return null; }
+            finally { if (engine != null) engine.Dispose(); }
+        }
+
         // The continuous engine identifies the start of an utterance and its possible words.
         // A separate final recognition of the complete, quiet-ended audio can finish sooner.
         private sealed class SongEndpoint
@@ -206,6 +255,7 @@ namespace PcOnSongBridge
             private readonly RecognizerInfo recognizer;
             private readonly VoiceCommand[] grammar;
             private readonly VoiceCommand[] songs;
+            private readonly SpeechRecognitionEngine standaloneVerifier;
             private readonly TalkbackStream stream;
             private readonly Action<MicrophoneResult> publish;
             private readonly CancellationToken token;
@@ -213,16 +263,19 @@ namespace PcOnSongBridge
             private int floor;
             private string possible;
             private bool sent;
+            private bool restoredOnset;
+            private long previousCommandEnd = -1;
             private Task<MicrophoneResult> verifier;
 
             internal SongEndpoint(RecognizerInfo recognizer, VoiceCommand[] grammar, TalkbackStream stream,
-                Action<MicrophoneResult> publish, CancellationToken token)
+                Action<MicrophoneResult> publish, CancellationToken token, SpeechRecognitionEngine standaloneVerifier)
             {
                 this.recognizer = recognizer;
                 this.grammar = grammar;
                 this.stream = stream;
                 this.publish = publish;
                 this.token = token;
+                this.standaloneVerifier = standaloneVerifier;
                 songs = grammar.Where(c => (c.Id == "next" || c.Id == "previous") && !grammar.Any(other =>
                     other.Phrase.StartsWith(c.Phrase + " ", StringComparison.OrdinalIgnoreCase))).ToArray();
             }
@@ -232,12 +285,41 @@ namespace PcOnSongBridge
                 lock (gate)
                 {
                     start = (long)Math.Round(position.TotalSeconds * SpeechSampleRate) * 2;
-                    lastLoud = start;
-                    var room = stream.CopyRange(Math.Max(0, start - 240 * BytesPerMillisecond), start, 0);
+                    int lookback = standaloneVerifier == null ? 240 : 400;
+                    var room = stream.CopyRange(Math.Max(0, start - lookback * BytesPerMillisecond), start, 0);
                     floor = RoomThreshold(room);
+                    restoredOnset = false;
+                    if (standaloneVerifier != null && previousCommandEnd >= 0 &&
+                        Math.Abs(start - previousCommandEnd) <= 650 * BytesPerMillisecond)
+                    {
+                        int preroll = MissingOnset(room, floor);
+                        start -= preroll;
+                        restoredOnset = preroll > 0;
+                    }
+                    lastLoud = start;
                     possible = null;
                     sent = false;
                 }
+            }
+
+            // SAPI can attribute the first syllable of a fast repeat to the preceding command.
+            // Recover it only when the mic has a distinct 200 ms quiet gap before that syllable.
+            private static int MissingOnset(byte[] room, int floor)
+            {
+                const int block = BlockMilliseconds * BytesPerMillisecond;
+                if (room == null) return 0;
+                int quiet = 0, boundary = -1;
+                for (int offset = 0; offset + block <= room.Length; offset += block)
+                {
+                    bool loud = false;
+                    for (int i = offset; i < offset + block; i += 2)
+                        if (Math.Abs((int)ReadSample(room, i)) > floor) { loud = true; break; }
+                    quiet = loud ? 0 : quiet + BlockMilliseconds;
+                    if (quiet >= 200) boundary = offset + block;
+                }
+                if (boundary < 0) return 0;
+                int clipped = room.Length - boundary;
+                return clipped < block || clipped > 160 * BytesPerMillisecond ? 0 : clipped + 60 * BytesPerMillisecond;
             }
 
             private static int RoomThreshold(byte[] room)
@@ -258,7 +340,8 @@ namespace PcOnSongBridge
                 lock (gate)
                 {
                     var song = songs.FirstOrDefault(c => c.Phrase.Equals(text, StringComparison.OrdinalIgnoreCase) ||
-                        c.Phrase.StartsWith(text + " ", StringComparison.OrdinalIgnoreCase));
+                        c.Phrase.StartsWith(text + " ", StringComparison.OrdinalIgnoreCase) ||
+                        (restoredOnset && text.EndsWith(" " + c.Phrase, StringComparison.OrdinalIgnoreCase)));
                     possible = song == null ? null : song.Id;
                 }
             }
@@ -293,20 +376,61 @@ namespace PcOnSongBridge
                     long ticks = duration * Stopwatch.Frequency / (SpeechSampleRate * 2);
                     verifier = Task.Run(() =>
                     {
-                        var result = ConfirmEndpoint(samples, recognizer, grammar, token);
+                        var result = standaloneVerifier == null ? ConfirmEndpoint(samples, recognizer, grammar, token) :
+                            ConfirmStandalone(samples);
                         return result == null ? null : ToCaptureClock(result, clipClock, ticks, result.PeakDbFs);
                     });
                 }
             }
 
-            internal void Finish(MicrophoneResult result)
+            // Reuse both grammars across commands. A final result can arrive while the early
+            // verifier is running. Each decode owns the engine's input until it completes.
+            private MicrophoneResult ConfirmStandalone(byte[] samples)
+            {
+                token.ThrowIfCancellationRequested();
+                try
+                {
+                    lock (standaloneVerifier)
+                    using (var clip = new MemoryStream(samples, false))
+                    {
+                        standaloneVerifier.SetInputToAudioStream(clip, new SpeechAudioFormatInfo(SpeechSampleRate,
+                            AudioBitsPerSample.Sixteen, AudioChannel.Mono));
+                        try
+                        {
+                            var recognized = standaloneVerifier.Recognize();
+                            return AcceptedTalkbackResult(recognized, grammar, SpeechPeak(recognized), 0, true);
+                        }
+                        finally { standaloneVerifier.SetInputToNull(); }
+                    }
+                }
+                catch (InvalidOperationException) { return null; }
+                catch (COMException) { return null; }
+            }
+
+            internal void Finish(MicrophoneResult result, RecognizedAudio audio, long origin)
             {
                 lock (gate)
                 {
+                    long end = audio == null ? -1 :
+                        (long)Math.Round((audio.AudioPosition + audio.Duration).TotalSeconds * SpeechSampleRate) * 2;
+                    if (!sent && restoredOnset && result.Command == null && end > start &&
+                        end - start <= 3 * SpeechSampleRate * 2)
+                    {
+                        var clip = stream.CopyRange(start, end, SpeechSampleRate);
+                        var recovered = clip == null ? null : ConfirmStandalone(clip);
+                        if (recovered != null && recovered.Command != null)
+                        {
+                            long clipClock = origin + start * Stopwatch.Frequency / (SpeechSampleRate * 2);
+                            long duration = (end - start) * Stopwatch.Frequency / (SpeechSampleRate * 2);
+                            result = ToCaptureClock(recovered, clipClock, duration, recovered.PeakDbFs);
+                        }
+                    }
+                    previousCommandEnd = sent || result.Command != null ? end : -1;
                     if (!sent) publish(result);
                     start = -1;
                     possible = null;
                     sent = false;
+                    restoredOnset = false;
                 }
             }
 

@@ -232,7 +232,8 @@ namespace PcOnSongBridge
             }
         }
 
-        internal static Grammar BuildCommandGrammar(RecognizerInfo recognizer, IEnumerable<VoiceCommand> enabled)
+        internal static Grammar BuildCommandGrammar(RecognizerInfo recognizer, IEnumerable<VoiceCommand> enabled,
+            bool allowSurroundingSpeech = false)
         {
             var phrases = new Choices();
             foreach (var command in enabled)
@@ -242,7 +243,15 @@ namespace PcOnSongBridge
                 phrases.Add(new SemanticResultValue(phrase, command.Id));
             }
             var builder = new GrammarBuilder { Culture = recognizer.Culture };
-            builder.Append(phrases);
+            if (allowSurroundingSpeech)
+            {
+                var otherSpeech = new GrammarBuilder { Culture = recognizer.Culture };
+                otherSpeech.AppendWildcard();
+                builder.Append(otherSpeech, 0, 1);
+                builder.Append(phrases);
+                builder.Append(otherSpeech, 0, 1);
+            }
+            else builder.Append(phrases);
             return new Grammar(builder);
         }
 
