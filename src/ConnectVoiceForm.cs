@@ -87,6 +87,17 @@ namespace PcOnSongBridge
                         d.Id == selectedMicrophone.Id && d.Name == selectedMicrophone.Name);
                     microphone.SelectedItem = desired ?? (devices.Count == 1 ? devices[0] : null);
                     recognizer = Audio.FindEnglishRecognizer();
+                    // Without a key, the key prompt stays as the first step.
+                    if (keyAvailable)
+                    {
+                        if (recognizer == null)
+                            status.Text = "Windows has no English desktop speech recognizer, so Listen for command is unavailable. " +
+                                "Add English speech in Windows language settings and reopen this window. Manual controls work after pairing.";
+                        else if (devices.Count == 0)
+                            status.Text = "No Windows recording input was found. Connect a microphone and reopen this window. Manual controls work after pairing.";
+                        else if (microphone.SelectedItem == null)
+                            status.Text = InitialStatus() + " Choose your command microphone before listening.";
+                    }
                 }
                 catch (Exception) { status.Text = "Windows could not list speech inputs. Manual controls are available after pairing."; }
                 UpdateEnabled();
@@ -195,8 +206,8 @@ namespace PcOnSongBridge
             token.ThrowIfCancellationRequested();
             var sample = await capture(token);
             token.ThrowIfCancellationRequested();
-            if (String.IsNullOrEmpty(sample.Command)) return Double.IsNegativeInfinity(sample.PeakDbFs) ?
-                "No microphone signal. Check the selected input." : "No command recognized. Press Listen for command to try again.";
+            if (String.IsNullOrEmpty(sample.Command)) return Audio.NoCommandMessage(sample.PeakDbFs) +
+                (Double.IsNegativeInfinity(sample.PeakDbFs) ? "" : " Press Listen for command to try again.");
             string reply = await send(sample.Command, token);
             if (!sample.SpeechEndTimestamp.HasValue) return reply;
             double elapsedMs = (Stopwatch.GetTimestamp() - sample.SpeechEndTimestamp.Value) * 1000.0 / Stopwatch.Frequency;

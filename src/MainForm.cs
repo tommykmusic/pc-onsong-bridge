@@ -955,7 +955,7 @@ namespace PcOnSongBridge
                     {
                         activity.Text = Double.IsNegativeInfinity(result.PeakDbFs)
                             ? "No microphone signal. Check the selected input with Test microphone."
-                            : "Microphone signal detected. Try a ready phrase from the command library.";
+                            : Audio.NoCommandMessage(result.PeakDbFs);
                         WriteLog(activity.Text);
                         return;
                     }
@@ -975,7 +975,7 @@ namespace PcOnSongBridge
             catch (OperationCanceledException) { if (!closing) activity.Text = "Navigation canceled."; }
             catch (Exception error)
             {
-                if (!closing) activity.Text = "Navigation failed. See Activity.";
+                if (!closing) activity.Text = "Navigation failed. " + (error.Message.Length <= 150 ? error.Message : "See Activity.");
                 WriteLog(error.Message);
             }
             finally

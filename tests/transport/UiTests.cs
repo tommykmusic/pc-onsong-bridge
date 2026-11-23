@@ -155,12 +155,13 @@ internal static class UiTests
             new NdiSource("TCL (Lyrics Projection)", "192.168.30.2:5961"),
             new NdiSource("iPad (Stage Monitor)", "192.168.30.3:5961") };
         internal TaskCompletionSource<bool> Starting, Stopping;
+        internal TaskCompletionSource<List<NdiSource>> Discovering;
         internal readonly List<string> SearchedHosts = new List<string>();
         internal List<NdiSource> Direct = new List<NdiSource>();
         internal override string FindRuntime() { return Installs == 0 ? null : "official-runtime"; }
         internal override Task InstallAsync(CancellationToken token) { Installs++; return Task.FromResult(true); }
         internal override Task<List<NdiSource>> DiscoverAsync(CancellationToken token)
-        { Finds++; return Task.FromResult(Advertised); }
+        { Finds++; return Discovering == null ? Task.FromResult(Advertised) : Discovering.Task; }
         internal override Task<List<NdiSource>> DiscoverAtAsync(string ip, CancellationToken token)
         {
             if (FindRuntime() == null) throw new InvalidOperationException("Set up Wi-Fi playback before connecting by address.");
@@ -185,12 +186,18 @@ internal static class UiTests
         var tool = main.OfType<TextBox>().Single(box => box.Text == Path.Combine(dir, "scrcpy.exe"));
         string configured = tool.Text;
         tool.Text = Path.Combine(dir, "missing-scrcpy.exe");
+        service.Discovering = new TaskCompletionSource<List<NdiSource>>();
         open.PerformClick();
         var dialog = form.OwnedForms.OfType<WifiCuesForm>().Single();
         dialog.Opacity = 0;
         var controls = Children(dialog).ToArray();
         Func<string, Button> button = name => controls.OfType<Button>().Single(b => b.Text == name);
         Func<string, ComboBox> picker = name => controls.OfType<ComboBox>().Single(b => b.AccessibleName == name);
+        await Until(() => service.Finds > 0, "opening Wi-Fi search");
+        if (button("Find my tablet").Enabled || !button("Wi-Fi voice control…").Enabled)
+            throw new Exception("Wi-Fi voice control waited for the stream search to finish.");
+        service.Discovering.SetResult(service.Advertised);
+        service.Discovering = null;
         var source = picker("OnSong Wi-Fi source");
         var output = picker("Wi-Fi cue output");
         var start = button("Start Wi-Fi cues");

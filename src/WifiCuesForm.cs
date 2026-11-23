@@ -112,7 +112,7 @@ namespace PcOnSongBridge
             };
             var voiceInfo = Label(ConnectSession.ConfiguredKey() == null ?
                 "To try microphone commands over Wi-Fi, open Wi-Fi voice control and enter your OnSong developer key." :
-                "For Windows microphone commands over the network, connect Wi-Fi voice control separately.");
+                "For Windows microphone commands over the network, open Wi-Fi voice control. You don’t need to wait for the stream search.");
             var sections = new Control[] { heading, directions, Row(sourceLabel, enterAddress), SelectRow(sources, find), addressRow, outputLabel, SelectRow(outputs, refreshOutputs),
                 setupInfo, Row(install, vendor), Row(start, stop), blocker, status, level, voiceInfo, Row(voice) };
             foreach (var c in sections) layout.Controls.Add(c);
@@ -252,7 +252,9 @@ namespace PcOnSongBridge
             install.Enabled = idle;
             start.Enabled = idle && !otherAudio && !String.IsNullOrEmpty(runtime) && sources.SelectedItem != null && outputs.SelectedItem != null;
             stop.Enabled = !closeRequested && (current == Activity.Starting || current == Activity.Receiving) && !(operation != null && operation.IsCancellationRequested);
-            voice.Enabled = !closeRequested && (idle || current == Activity.Receiving);
+            // OnSong Connect is independent of NDI discovery and playback setup. Musicians can pair and test
+            // voice commands while the stream search runs or the runtime installer is open.
+            voice.Enabled = !closeRequested && current != Activity.Starting && current != Activity.Stopping;
             blocker.Text = otherAudio && !PlaybackBusy ? "Stop Android mirrored cue audio in the main window before starting Wi-Fi playback." : "";
             blocker.Visible = blocker.Text.Length > 0;
         }

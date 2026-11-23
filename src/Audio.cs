@@ -62,6 +62,16 @@ namespace PcOnSongBridge
             return Task.Run(() => PlayTestTone(device));
         }
 
+        // Live feedback when the microphone heard sound but no ready phrase. The level tells a musician
+        // whether to check the input gain or simply repeat the phrase.
+        internal static string NoCommandMessage(double peakDbFs)
+        {
+            if (Double.IsNegativeInfinity(peakDbFs)) return "No microphone signal. Check the selected input.";
+            string level = "peak " + peakDbFs.ToString("0", System.Globalization.CultureInfo.CurrentCulture) + " dBFS";
+            return peakDbFs < -40 ? "No command recognized. The microphone was very quiet (" + level + "). Move closer or raise the input level." :
+                "No command recognized (" + level + "). Say the phrase clearly after Listening appears.";
+        }
+
         public static RecognizerInfo FindEnglishRecognizer()
         {
             return SpeechRecognitionEngine.InstalledRecognizers()

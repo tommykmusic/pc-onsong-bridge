@@ -158,6 +158,8 @@ internal static class ConnectTests
             Check(sends == 1 && result.StartsWith(Double.IsNegativeInfinity(peak) ? "No microphone signal" : "No command recognized"),
                 "Unrecognized input dispatched a command.");
         }
+        string quiet = ConnectVoiceForm.ListenOnce(t => Task.FromResult(new MicrophoneResult(-52, null)), send, NoCancel).Result;
+        Check(sends == 1 && quiet.Contains("very quiet") && quiet.Contains("dBFS"), "A quiet microphone did not report its level.");
         using (var source = new CancellationTokenSource())
         {
             try
