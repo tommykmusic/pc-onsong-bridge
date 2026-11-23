@@ -53,7 +53,7 @@ internal static class LatencyTests
                 tone[i * 2 + 1] = (byte)(sample >> 8);
             }
             Measure("tone", tone, null, ids, recognizer);
-            Measure("continuous low-level noise under speech", next, "next", ids, recognizer, backgroundNoise: true);
+            timings.Add(Measure("continuous low-level noise under speech", next, "next", ids, recognizer, backgroundNoise: true));
             CheckSingleCommand(next, previous, recognizer, ids);
             CheckFailedSource(recognizer, ids);
             using (var stop = new CancellationTokenSource(150))

@@ -149,7 +149,7 @@ namespace PcOnSongBridge
 
         // SAPI's IStream adapter requires Length and Position before it starts recording.
         // The bounded window also permits SAPI to seek back over audio it has already read.
-        private sealed class LiveSpeechStream : Stream
+        internal sealed class LiveSpeechStream : Stream
         {
             private readonly object sync = new object();
             private readonly byte[] data;
@@ -157,7 +157,8 @@ namespace PcOnSongBridge
             private int position;
             private bool complete;
             private int peak;
-            private int blocks;
+            private readonly int[] initialPeaks = new int[5];
+            private int initialPeakCount;
             private int ambientPeak;
             internal int LastActivity { get; private set; }
             internal int QuietMilliseconds { get { return (written - LastActivity) * 1000 / (SpeechSampleRate * 2); } }
@@ -177,10 +178,16 @@ namespace PcOnSongBridge
                 for (int offset = 0; offset + 1 < pcm.Length; offset += 2)
                     blockPeak = Math.Max(blockPeak, Math.Abs((int)ReadSample(pcm, offset)));
                 peak = Math.Max(blockPeak, peak);
-                if (blocks < 5)
+                if (initialPeakCount < initialPeaks.Length)
                 {
-                    blocks++;
-                    ambientPeak = Math.Max(ambientPeak, Math.Min(blockPeak, 600));
+                    initialPeaks[initialPeakCount++] = blockPeak;
+                    if (initialPeakCount == initialPeaks.Length)
+                    {
+                        // One startup click or empty device block should not set the room level.
+                        Array.Sort(initialPeaks);
+                        int median = initialPeaks[initialPeaks.Length / 2];
+                        if (median <= 600) ambientPeak = median;
+                    }
                 }
                 lock (sync)
                 {
@@ -197,7 +204,7 @@ namespace PcOnSongBridge
                         previous = next;
                     }
                     // Accelerate when trailing blocks drop near silence or back to the initial room floor.
-                    int floor = peak > ambientPeak * 3 ? Math.Min(1200, ambientPeak * 2) : 0;
+                    int floor = peak > ambientPeak * 3 ? ambientPeak * 2 : 0;
                     if (blockPeak > Math.Max(24, Math.Max(floor, Math.Min(180, peak / 100)))) LastActivity = written;
                     Monitor.PulseAll(sync);
                 }

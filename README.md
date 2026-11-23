@@ -2,16 +2,9 @@
 
 PC OnSong Bridge sends a tablet’s spoken song and section cues to laptop speakers, a USB mixer, or another Windows playback device. The tablet stays in charge of OnSong. The bridge can also use a Windows microphone to change songs or scroll a chart.
 
-**[Download the Windows beta](https://github.com/tommykmusic/pc-onsong-bridge/releases/tag/v0.8.0)**. Download `PC-OnSong-Bridge-Setup.exe` from the release (it is also inside the release ZIP) and run it. The installer runs under your Windows account and needs no administrator rights.
+**[Download the Windows beta](https://github.com/tommykmusic/pc-onsong-bridge/releases/tag/v0.8.1)**. Choose `PC-OnSong-Bridge-Setup.exe` to install under your Windows account. The release ZIP also includes the installer and source.
 
-Because this beta is unsigned, your browser (Edge or Chrome) may warn that `PC-OnSong-Bridge-Setup.exe` isn’t commonly downloaded—choose **Keep** (or **Show more → Keep anyway**). When you run it, Windows may show **Windows protected your PC**: choose **More info**, confirm the publisher reads **Unknown publisher**, then choose **Run anyway**.
-
-<details>
-<summary>Optional: verify the download checksum before running</summary>
-
-Run `Get-FileHash .\PC-OnSong-Bridge-Setup.exe` in PowerShell and compare the result with `SHA256SUMS.txt` on the release page.
-
-</details>
+The beta installer is unsigned. If your browser says it’s uncommon, check that you’re on the project’s GitHub release page. In the download folder, run `Get-FileHash .\PC-OnSong-Bridge-Setup.exe` in PowerShell and compare the full SHA-256 with the installer entry in `SHA256SUMS.txt` from that release. For a matching download you trust, the Windows SmartScreen reputation prompt offers **More info → Run anyway**. Stop if the checksum differs or your security software reports malware.
 
 | What has been tested | What to expect in this beta |
 | --- | --- |
@@ -144,9 +137,8 @@ In a separate test, reading the tablet’s chart layout took 3.40 s. A generated
 
 ## Quick troubleshooting
 
-- **Browser or Windows blocks the installer:** In Edge/Chrome, choose **Keep → Show more → Keep anyway**. On the Windows SmartScreen prompt (**Windows protected your PC**), choose **More info → Run anyway**.
 - **No Wi-Fi stream found:** Confirm both devices are on the same band Wi-Fi (not a guest network with client isolation), start another search, and tap **Stop Streaming** then **Go Live** in OnSong. If discovery is blocked, click **Enter tablet address** and type the tablet’s Wi-Fi IPv4 address.
-- **Microphone not recognized, too quiet, or clipping:** Check the level reported after **Listen for command** or **Test microphone**. Below −60 dBFS usually means the mic is muted or unplugged; −60 to −40 dBFS means raise input gain or move closer; 0 dBFS means lower input gain to stop clipping. If you plug in a USB mic or mixer after opening **Wi-Fi voice control**, click **Refresh** next to the microphone picker.
+- **Microphone level or recognition problems:** Check the peak after **Listen for command** or **Test microphone**. Below −60 dBFS, check the selected input, mute switch and mic connection. Between −60 and −40 dBFS, try speaking closer or raising input gain. At −1 dBFS or higher, lower the gain to leave some headroom. If you connect a USB mic or mixer after opening **Wi-Fi voice control**, click **Refresh** next to the microphone picker.
 - **USB tablet not listed:** Use a USB data cable (not charge-only), turn on **Developer options → USB debugging**, unlock the tablet to accept the **Allow USB debugging** prompt, then click **Refresh tablets**.
 
 ## Build from source

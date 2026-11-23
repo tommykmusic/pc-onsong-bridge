@@ -167,9 +167,7 @@ namespace PcOnSongBridge
             voice.Click += delegate
             {
                 var source = sources.SelectedItem as NdiSource;
-                string typed = tabletIp.Text.Trim();
-                string address = source != null ? Host(source.Address) :
-                    IsTabletIp(typed) ? typed : Host(preferences.WifiCueSourceAddress);
+                string address = VoiceAddress(source, tabletIp.Text, preferences.WifiCueSourceAddress);
                 using (var dialog = new ConnectVoiceForm(address, microphone())) dialog.ShowDialog(this);
                 UpdateVoiceInfo();
             };
@@ -204,6 +202,18 @@ namespace PcOnSongBridge
         {
             IPAddress parsed;
             return IPAddress.TryParse(text, out parsed) && parsed.AddressFamily == AddressFamily.InterNetwork && parsed.ToString() == text;
+        }
+
+        internal static string VoiceAddress(NdiSource selected, string entered, string saved)
+        {
+            var candidates = new[] { Host(selected == null ? null : selected.Address), (entered ?? "").Trim(), Host(saved) };
+            foreach (string candidate in candidates)
+            {
+                IPAddress address;
+                if (IPAddress.TryParse(candidate, out address) && address.ToString() == candidate &&
+                    ConnectSession.IsPrivateTabletAddress(address)) return candidate;
+            }
+            return "";
         }
         private static Label Label(string text)
         { return new Label { Text = text, AutoSize = true, Margin = new Padding(0, 4, 0, 4), Anchor = AnchorStyles.Left }; }

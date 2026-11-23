@@ -44,6 +44,7 @@ internal static class VoiceTests
         CheckLevel(new byte[] { 0, 0, 0, 64 }, -6.0206);
         CheckLevel(new byte[] { 0, 128, 0, 0 }, 0);
         Console.WriteLine("PASS Digital silence, half scale and negative full scale without a recognizer");
+        CheckSpeechEndpoint();
 
         var inputs = Audio.GetInputs();
         const string shortName = "Microphone Array (AMD Audio Dev";
@@ -121,6 +122,26 @@ internal static class VoiceTests
             var commands = VoiceCommands.ForMode(TabletControlMode.SongSwipes, new[] { binding });
             CheckPhrase(voice, recognizer, binding.Phrase, binding.Id, 1, commands);
         }
+    }
+
+    private static void CheckSpeechEndpoint()
+    {
+        using (var stream = new Audio.LiveSpeechStream(1000))
+        {
+            var block = new byte[16000 * Audio.BlockMilliseconds / 1000 * 2];
+            Action<int> append = peak =>
+            {
+                block[0] = (byte)peak;
+                block[1] = (byte)(peak >> 8);
+                stream.Append(block, 16000, 1);
+            };
+            // Five startup blocks, including a click and an empty buffer, followed by loud and soft syllables.
+            foreach (int peak in new[] { 2100, 0, 220, 230, 225, 5000, 750 }) append(peak);
+            Require(stream.QuietMilliseconds == 0, "A startup transient masked the quieter end of a phrase.");
+            for (int i = 0; i < 8; i++) append(225);
+            Require(stream.QuietMilliseconds == 160, "Steady room noise delayed the end of the phrase.");
+        }
+        Console.WriteLine("PASS Quiet syllable and 160 ms of trailing room noise after a startup click");
     }
 
     private static void CheckCommandLibrary()

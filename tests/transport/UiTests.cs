@@ -178,8 +178,26 @@ internal static class UiTests
         { Stops++; return Stopping == null ? Task.FromResult(true) : Stopping.Task; }
     }
 
+    private static void CheckVoiceAddresses()
+    {
+        var selected = new NdiSource("Tablet stream", "192.168.30.2:5961");
+        const string entered = "192.168.30.3", saved = "192.168.30.4:5961";
+        if (WifiCuesForm.VoiceAddress(selected, entered, saved) != "192.168.30.2")
+            throw new Exception("Voice setup ignored the selected tablet's address or used its NDI port.");
+        foreach (string streamAddress in new[] { "", "tablet.local:5961", "[::1]:5961", "203.0.113.1:5961" })
+        {
+            var stream = new NdiSource("Tablet stream", streamAddress);
+            if (WifiCuesForm.VoiceAddress(stream, entered, saved) != entered)
+                throw new Exception("An unusable stream address hid the entered tablet address.");
+        }
+        if (WifiCuesForm.VoiceAddress(null, "", saved) != "192.168.30.4" ||
+            WifiCuesForm.VoiceAddress(null, "invalid", "tablet.local:5961") != "")
+            throw new Exception("Voice setup offered an incorrect starting address with no stream selected.");
+    }
+
     private static async Task ExerciseWifi(MainForm form, FakeWifi service, string dir)
     {
+        CheckVoiceAddresses();
         var main = Children(form).ToArray();
         var open = main.OfType<Button>().Single(b => b.Text == "Find my tablet");
         var mirror = main.OfType<Button>().Single(b => b.Text == "Start cue audio");

@@ -66,19 +66,23 @@ internal static class ConnectTests
             mock.Accept = true;
             session.AuthorizeAsync(NoCancel).Wait();
             Check(session.Approved && mock.Registered && mock.Token == token, "Approved token not in use.");
-            Check(session.SendAsync("previous", NoCancel).Result.Contains("first") && mock.Writes == 0, "Wrapped at first song.");
-            Check(session.SendAsync("next", NoCancel).Result.Contains("confirmed") && mock.Index == 1, "Next was not verified.");
-            Check(session.SendAsync("next", NoCancel).Result.Contains("last") && mock.Writes == 1, "Wrapped at last song.");
+            var first = session.SendAsync("previous", NoCancel).Result;
+            Check(!first.ConfirmedAt.HasValue && first.Message.Contains("first") && mock.Writes == 0, "Wrapped at first song.");
+            Check(session.SendAsync("next", NoCancel).Result.ConfirmedAt.HasValue && mock.Index == 1, "Next was not verified.");
+            var last = session.SendAsync("next", NoCancel).Result;
+            Check(!last.ConfirmedAt.HasValue && last.Message.Contains("last") && mock.Writes == 1, "Wrapped at last song.");
             mock.InlineSongs = false;
-            Check(session.SendAsync("previous", NoCancel).Result.Contains("confirmed") && mock.Index == 0, "Ordered set lookup failed.");
-            Check(session.SendAsync("scroll-down", NoCancel).Result.Contains("confirmed") && mock.Position == 0.2, "Scroll down failed.");
-            Check(session.SendAsync("scroll-up", NoCancel).Result.Contains("confirmed") && mock.Position == 0.0, "Scroll up failed.");
-            Check(session.SendAsync("scroll-up", NoCancel).Result.Contains("top") && mock.Writes == 4, "Rewrote top position.");
+            Check(session.SendAsync("previous", NoCancel).Result.ConfirmedAt.HasValue && mock.Index == 0, "Ordered set lookup failed.");
+            Check(session.SendAsync("scroll-down", NoCancel).Result.ConfirmedAt.HasValue && mock.Position == 0.2, "Scroll down failed.");
+            Check(session.SendAsync("scroll-up", NoCancel).Result.ConfirmedAt.HasValue && mock.Position == 0.0, "Scroll up failed.");
+            var top = session.SendAsync("scroll-up", NoCancel).Result;
+            Check(!top.ConfirmedAt.HasValue && top.Message.Contains("top") && mock.Writes == 4, "Rewrote top position.");
             mock.Duplicate = true;
             Fails(() => session.SendAsync("next", NoCancel), "unique");
             mock.Duplicate = false;
             mock.IgnoreWrite = true;
-            Check(session.SendAsync("next", NoCancel).Result.Contains("not confirmed") && mock.Writes == 5, "Unobserved move was reported or repeated.");
+            var unconfirmed = session.SendAsync("next", NoCancel).Result;
+            Check(!unconfirmed.ConfirmedAt.HasValue && unconfirmed.Message.Contains("not confirmed") && mock.Writes == 5, "Unobserved move was reported or repeated.");
             mock.IgnoreWrite = false;
             CheckVoice(session, mock);
             mock.Revoked = true;
@@ -129,6 +133,7 @@ internal static class ConnectTests
                 Check(dialog.DialogResult == DialogResult.OK && ConnectSession.ConfiguredKey(keyStore) == "fixture-local-key",
                     "Saved key failed to round trip or override the environment fallback.");
             }
+            CheckMicrophoneHints(keyStore);
             using (var stored = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(settingsPath, true))
             {
                 byte[] encrypted = (byte[])stored.GetValue("DeveloperKey");
@@ -146,11 +151,40 @@ internal static class ConnectTests
         Console.WriteLine("PASS keyless dialog and one phrase per press, no-match, silent input, and cancellation");
     }
 
+    private static void CheckMicrophoneHints(ConnectKeyStore keyStore)
+    {
+        using (var form = new ConnectVoiceForm("192.168.1.2", null, keyStore))
+        {
+            form.ShowInTaskbar = false; form.Opacity = 0; form.Show();
+            var controls = Descendants(form).ToArray();
+            var hint = controls.OfType<Label>().Single(l => l.AccessibleName == "Microphone availability");
+            var status = controls.OfType<Label>().Single(l => l.AccessibleName != null && l.AccessibleName.StartsWith("Wi-Fi voice control."));
+            var picker = controls.OfType<ComboBox>().Single();
+            var devices = new List<AudioDevice> { new AudioDevice(1, "Laptop"), new AudioDevice(2, "Interface") };
+            string pairingMessage = status.Text;
+            form.SetSpeechInputs(devices, null, null);
+            Check(hint.Visible && hint.Text.Contains("no English desktop speech recognizer"), "Missing recognizer hint.");
+            var recognizer = Audio.FindEnglishRecognizer();
+            if (recognizer != null)
+            {
+                form.SetSpeechInputs(new List<AudioDevice>(), recognizer, null);
+                Check(hint.Visible && hint.Text.Contains("No Windows recording input"), "Missing microphone hint after recognizer refresh.");
+                form.SetSpeechInputs(devices, recognizer, null);
+                Check(hint.Visible && hint.Text.Contains("Choose your command microphone"), "Missing microphone selection hint.");
+                picker.SelectedIndex = 1;
+                Check(!hint.Visible && status.Text == pairingMessage, "Selecting a microphone retained an obsolete hint or overwrote pairing status.");
+                form.SetSpeechInputs(devices, recognizer, devices[1]);
+                Check(!hint.Visible && picker.SelectedItem == devices[1], "Refreshing lost the usable microphone.");
+            }
+            form.Close();
+        }
+    }
+
     private static void CheckSingleListen()
     {
         int captures = 0, sends = 0;
         Func<CancellationToken, Task<MicrophoneResult>> sample = delegate { captures++; return Task.FromResult(new MicrophoneResult(-12, "next")); };
-        Func<string, CancellationToken, Task<string>> send = (id, token) => { sends++; return Task.FromResult(id); };
+        Func<string, CancellationToken, Task<ConnectCommandResult>> send = (id, token) => { sends++; return Task.FromResult(new ConnectCommandResult(id)); };
         Check(ConnectVoiceForm.ListenOnce(sample, send, NoCancel).Result == "next" && captures == 1 && sends == 1, "One press did not produce one command.");
         foreach (double peak in new[] { -15.0, Double.NegativeInfinity })
         {
@@ -162,8 +196,13 @@ internal static class ConnectTests
         Check(sends == 1 && quiet.Contains("very quiet") && quiet.Contains("dBFS"), "A quiet microphone did not report its level.");
         string muted = ConnectVoiceForm.ListenOnce(t => Task.FromResult(new MicrophoneResult(-78, null)), send, NoCancel).Result;
         Check(sends == 1 && muted.Contains("No usable microphone signal") && muted.Contains("dBFS"), "A noise-floor microphone did not warn about mute/connection.");
-        string clipped = ConnectVoiceForm.ListenOnce(t => Task.FromResult(new MicrophoneResult(0, null)), send, NoCancel).Result;
-        Check(sends == 1 && clipped.Contains("clipping") && clipped.Contains("dBFS"), "A clipping microphone did not warn to lower gain.");
+        foreach (double peak in new[] { -1.0, -0.5, 0.0 })
+        {
+            string high = ConnectVoiceForm.ListenOnce(t => Task.FromResult(new MicrophoneResult(peak, null)), send, NoCancel).Result;
+            Check(sends == 1 && high.Contains("near full scale") && high.Contains("dBFS") && high.Contains("Lower the input gain"),
+                "Near-full-scale input did not show its level and gain guidance.");
+        }
+        Check(!Audio.NoCommandMessage(-1.1).Contains("near full scale"), "High-level guidance appeared below its threshold.");
         using (var source = new CancellationTokenSource())
         {
             try
@@ -175,14 +214,16 @@ internal static class ConnectTests
             Check(sends == 1, "Canceled recognition dispatched a command.");
         }
         long speechEnd = Stopwatch.GetTimestamp() - Stopwatch.Frequency / 5;
-        var timed = ConnectVoiceForm.ListenOnce(t => Task.FromResult(new MicrophoneResult(-12, "next", null, speechEnd)),
-            (id, t) => Task.FromResult("Already at the last song."), NoCancel).Result;
-        Check(timed.StartsWith("Already at the last song. Tablet response received ") && timed.EndsWith(" ms after speech ended."),
-            "The response timing must preserve the tablet's actual outcome.");
-        var unconfirmed = ConnectVoiceForm.ListenOnce(t => Task.FromResult(new MicrophoneResult(-12, "next", null, speechEnd)),
-            (id, t) => Task.FromResult("Command sent. OnSong has not confirmed the new position."), NoCancel).Result;
-        Check(unconfirmed == "Command sent. OnSong has not confirmed the new position.",
-            "An unconfirmed chart change must not display a response timing figure.");
+        Func<CancellationToken, Task<MicrophoneResult>> timedSample = t => Task.FromResult(new MicrophoneResult(-12, "next", null, speechEnd));
+        var confirmed = new ConnectCommandResult("OnSong confirmed the song change.", speechEnd + Stopwatch.Frequency / 10);
+        var timed = ConnectVoiceForm.ListenOnce(timedSample, (id, t) => Task.FromResult(confirmed), NoCancel).Result;
+        Check(timed == "OnSong confirmed the song change. Tablet confirmation received 100 ms after speech ended.",
+            "Use the tablet readback timestamp to measure confirmation.");
+        foreach (var message in new[] { "Already at the last song.", "Command sent. OnSong has not confirmed the new position." })
+        {
+            var result = ConnectVoiceForm.ListenOnce(timedSample, (id, t) => Task.FromResult(new ConnectCommandResult(message)), NoCancel).Result;
+            Check(result == message, "An unchanged or unconfirmed chart displayed a timing figure.");
+        }
     }
     private static void CheckLoopbackRedirect(ConnectTokenStore store)
     {
@@ -309,16 +350,27 @@ internal static class ConnectTests
         using (var session = new ConnectSession(Endpoint, "fixture-key", store, tablet))
         {
             session.IdentifyAsync(NoCancel).GetAwaiter().GetResult();
-            foreach (int code in new[] { 401, 403 })
+            var denials = new[]
+            {
+                new { Code = 401, Reason = "Unauthorized", Known = true },
+                new { Code = 403, Reason = "Forbidden", Known = true },
+                new { Code = 403, Reason = "fixture-key {token}", Known = false },
+                new { Code = 403, Reason = "Private fixture set name", Known = false },
+                new { Code = 401, Reason = "", Known = false }
+            };
+            foreach (var denial in denials)
             {
                 session.AuthorizeAsync(NoCancel).GetAwaiter().GetResult();
                 Check(session.Approved, "A successful pairing check did not enable control.");
-                tablet.RefuseWriteStatus = code;
+                tablet.RefuseWriteStatus = denial.Code;
+                tablet.RefuseWriteReason = denial.Reason.Replace("{token}", tablet.Token);
                 int attempts = tablet.WriteAttempts;
-                string message = Fails(() => session.SendAsync("next", NoCancel), "change the chart (HTTP " + code);
+                string message = Fails(() => session.SendAsync("next", NoCancel), "change the chart (HTTP " + denial.Code);
                 Check(message.Contains("remote-control access") && !message.Contains("expired") &&
                     !message.Contains("fixture-key") && !message.Contains(tablet.Token) &&
-                    (code != 401 || message.Contains("Server detail: Unauthorized.")), "Incorrect permission feedback.");
+                    !message.Contains("Private fixture") && (denial.Known
+                        ? message.Contains("Server detail: " + denial.Reason + ".")
+                        : !message.Contains("Server detail:")), "Incorrect permission feedback or disclosure of tablet details.");
                 Check(tablet.WriteAttempts == attempts + 1 && !session.Approved && tablet.Index == 0 && tablet.Writes == 0,
                     "A denied chart change was retried, applied, or left control enabled.");
                 int requests = tablet.Requests;
@@ -329,7 +381,7 @@ internal static class ConnectTests
             tablet.InlineSongs = false;
             tablet.RefuseSetRead = true;
             string setMessage = Fails(() => session.SendAsync("next", NoCancel), "read the current set (HTTP 403");
-            Check(!session.Approved && tablet.WriteAttempts == 2 && !setMessage.Contains("fixture-key"),
+            Check(!session.Approved && tablet.WriteAttempts == denials.Length && !setMessage.Contains("fixture-key"),
                 "An unreadable set leaked data or attempted navigation.");
         }
         Console.WriteLine("PASS registered Android token and successful state read followed by refused write or set read, with no retry or credential disclosure");
@@ -354,7 +406,7 @@ internal static class ConnectTests
                 var audio = new byte[6400].Concat(pcm.ToArray()).Concat(new byte[16000]).ToArray();
                 var heard = Audio.AnalyzeRecording(audio, 16000, 1, recognizer, commands, NoCancel);
                 int writes = mock.Writes;
-                Check(heard.Command == id && session.SendAsync(heard.Command, NoCancel).Result.Contains("confirmed") && mock.Writes == writes + 1,
+                Check(heard.Command == id && session.SendAsync(heard.Command, NoCancel).Result.ConfirmedAt.HasValue && mock.Writes == writes + 1,
                     "Voice-to-Connect dispatch failed for " + id);
             }
         }
@@ -370,6 +422,7 @@ internal static class ConnectTests
         internal object AndroidAuth;
         internal int AndroidStatus = 200;
         internal int RefuseWriteStatus, WriteAttempts;
+        internal string RefuseWriteReason;
         internal bool RefuseSetRead;
         private readonly JavaScriptSerializer json = new JavaScriptSerializer();
 
@@ -415,7 +468,12 @@ internal static class ConnectTests
             Check(request.Method == HttpMethod.Post, "Unexpected write.");
             WriteAttempts++;
             if (RefuseWriteStatus != 0)
-                return Reply(new { error = RefuseWriteStatus == 401 ? "Unauthorized" : "fixture-key " + Token }, RefuseWriteStatus);
+            {
+                var denied = Reply(new { error = RefuseWriteReason }, RefuseWriteStatus);
+                denied.Headers.WwwAuthenticate.Add(new System.Net.Http.Headers.AuthenticationHeaderValue(
+                    "Bearer", "realm=\"Private fixture tablet\""));
+                return denied;
+            }
             var update = json.Deserialize<Dictionary<string, object>>(await request.Content.ReadAsStringAsync());
             Writes++;
             if (!IgnoreWrite)

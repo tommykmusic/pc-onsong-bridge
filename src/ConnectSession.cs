@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
 using System.Net;
@@ -13,6 +14,18 @@ using System.Web.Script.Serialization;
 
 namespace PcOnSongBridge
 {
+    internal sealed class ConnectCommandResult
+    {
+        internal readonly string Message;
+        internal readonly long? ConfirmedAt;
+
+        internal ConnectCommandResult(string message, long? confirmedAt = null)
+        {
+            Message = message;
+            ConfirmedAt = confirmedAt;
+        }
+    }
+
     // OnSong 2026 header authentication and state API: onsongapp.com/developers/connect/api/
     internal sealed class ConnectSession : IDisposable
     {
@@ -36,11 +49,17 @@ namespace PcOnSongBridge
                 address.ToString() != parts[0] || (parts.Length == 2 && (!Int32.TryParse(parts[1], NumberStyles.None,
                     CultureInfo.InvariantCulture, out port) || port <= 0 || port > 65535)))
                 throw new ArgumentException("Enter the tablet’s Wi-Fi IPv4 address, optionally followed by its OnSong Connect port.");
-            var b = address.GetAddressBytes();
-            if (!(b[0] == 10 || (b[0] == 172 && b[1] >= 16 && b[1] <= 31) || (b[0] == 192 && b[1] == 168) ||
-                (b[0] == 169 && b[1] == 254)))
+            if (!IsPrivateTabletAddress(address))
                 throw new ArgumentException("Choose the tablet’s private Wi-Fi address on this local network.");
             return new UriBuilder("http", address.ToString(), port, "/api/_/").Uri;
+        }
+
+        internal static bool IsPrivateTabletAddress(IPAddress address)
+        {
+            if (address.AddressFamily != AddressFamily.InterNetwork) return false;
+            var bytes = address.GetAddressBytes();
+            return bytes[0] == 10 || (bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31) ||
+                (bytes[0] == 192 && bytes[1] == 168) || (bytes[0] == 169 && bytes[1] == 254);
         }
 
         internal static ConnectSession Open(string address, ConnectKeyStore keyStore = null)
@@ -133,7 +152,7 @@ namespace PcOnSongBridge
             return value == "Token Registered" || value == "Token Accepted";
         }
 
-        internal async Task<string> SendAsync(string id, CancellationToken cancel)
+        internal async Task<ConnectCommandResult> SendAsync(string id, CancellationToken cancel)
         {
             if (!new[] { "next", "previous", "scroll-up", "scroll-down" }.Contains(id))
                 throw new ArgumentException("This command is unavailable through OnSong Connect.");
@@ -168,7 +187,8 @@ namespace PcOnSongBridge
                     if (ids.Count(s => s == song) != 1)
                         throw new InvalidOperationException("OnSong did not identify a unique position for this song in the set (it may appear more than once in the setlist).");
                     int next = Array.IndexOf(ids, song) + (id == "next" ? 1 : -1);
-                    if (next < 0 || next >= ids.Length) return next < 0 ? "Already at the first song." : "Already at the last song.";
+                    if (next < 0 || next >= ids.Length)
+                        return new ConnectCommandResult(next < 0 ? "Already at the first song." : "Already at the last song.");
                     targetSong = ids[next];
                     if (String.IsNullOrWhiteSpace(targetSong) || ids.Count(s => s == targetSong) != 1)
                         throw new InvalidOperationException("The adjacent set entry has no unique song ID.");
@@ -178,7 +198,8 @@ namespace PcOnSongBridge
                 {
                     double initialPosition = Position(initial);
                     targetPosition = Math.Max(0, Math.Min(1, initialPosition + (id == "scroll-down" ? 0.2 : -0.2)));
-                    if (Math.Abs(initialPosition - targetPosition) < 0.0001) return targetPosition == 0 ? "Already at the top." : "Already at the bottom.";
+                    if (Math.Abs(initialPosition - targetPosition) < 0.0001)
+                        return new ConnectCommandResult(targetPosition == 0 ? "Already at the top." : "Already at the bottom.");
                     update = new { position = targetPosition };
                 }
                 // An interrupted write must not repeat a song change. Only read back after this point.
@@ -189,9 +210,10 @@ namespace PcOnSongBridge
                     var state = Map(await Request(HttpMethod.Get, "state", null, true, moveSong ? "confirm the chart change" : "confirm the scroll position", cancel).ConfigureAwait(false));
                     if (ObjectId(state, "song") == targetSong && ObjectId(state, "set") == set &&
                         (moveSong || Math.Abs(Position(state) - targetPosition) <= 0.025))
-                        return moveSong ? "OnSong confirmed the song change." : "OnSong confirmed the scroll position.";
+                        return new ConnectCommandResult(moveSong ? "OnSong confirmed the song change." :
+                            "OnSong confirmed the scroll position.", Stopwatch.GetTimestamp());
                 }
-                return "Command sent. OnSong has not confirmed the new position.";
+                return new ConnectCommandResult("Command sent. OnSong has not confirmed the new position.");
             }
             finally { commandLock.Release(); }
         }
@@ -225,17 +247,17 @@ namespace PcOnSongBridge
             return values.TryGetValue(key, out value) ? value as string : null;
         }
 
-        private string SafeServerDetail(string reason, HttpResponseMessage response)
+        private static string SafeServerDetail(string reason)
         {
-            string detail = reason;
-            if (String.IsNullOrWhiteSpace(detail) && response.Headers.WwwAuthenticate != null && response.Headers.WwwAuthenticate.Count > 0)
-                detail = String.Join(", ", response.Headers.WwwAuthenticate.Select(h => h.ToString()));
-            if (String.IsNullOrWhiteSpace(detail)) return null;
-            detail = new string(detail.Trim().Where(c => !Char.IsControl(c)).ToArray());
-            if (String.IsNullOrWhiteSpace(detail)) return null;
-            if (!String.IsNullOrEmpty(developerKey) && detail.IndexOf(developerKey, StringComparison.OrdinalIgnoreCase) >= 0) return null;
-            if (!String.IsNullOrEmpty(token) && detail.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0) return null;
-            return detail.Length <= 80 ? detail : detail.Substring(0, 80) + "…";
+            // Only display known response labels. A free-form error or authentication
+            // challenge can include private details that a musician might share with support.
+            switch (reason)
+            {
+                case "Unauthorized": return "Unauthorized";
+                case "Forbidden": return "Forbidden";
+                case "Not Accepting Users": return "Not Accepting Users";
+                default: return null;
+            }
         }
 
         private async Task<object> Request(HttpMethod method, string route, object body, bool authenticated, string operation, CancellationToken cancel,
@@ -278,7 +300,7 @@ namespace PcOnSongBridge
                     if (allowAuthError && reason == "Not Accepting Users") return value;
                     if (accessDenied)
                     {
-                        string detail = SafeServerDetail(reason, response);
+                        string detail = SafeServerDetail(reason);
                         throw new InvalidOperationException("OnSong refused permission to " + operation +
                             (status == 401 ? " (HTTP 401 Unauthorized)." : " (HTTP 403 Forbidden).") +
                             (detail == null ? "" : " Server detail: " + detail + ".") +
