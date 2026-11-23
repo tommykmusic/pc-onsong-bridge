@@ -2,7 +2,9 @@
 
 PC OnSong Bridge sends a tablet’s spoken song and section cues to laptop speakers, a USB mixer, or another Windows playback device. The tablet stays in charge of OnSong. The bridge can also use a Windows microphone to change songs or scroll a chart.
 
-**[Download the Windows beta](https://github.com/tommykmusic/pc-onsong-bridge/releases/tag/v0.8.0)**. Extract the release ZIP and run the unsigned `PC-OnSong-Bridge-Setup.exe`. The installer runs under your Windows account.
+**[Download the Windows beta](https://github.com/tommykmusic/pc-onsong-bridge/releases/tag/v0.8.0)**. Download `PC-OnSong-Bridge-Setup.exe` from the release (it is also inside the release ZIP) and run it. The installer runs under your Windows account and needs no administrator rights.
+
+Because this beta is unsigned, Windows may show **Windows protected your PC**. To continue, choose **More info**, check that the publisher reads **Unknown publisher**, then choose **Run anyway**. To confirm the download first, run `Get-FileHash .\PC-OnSong-Bridge-Setup.exe` in PowerShell and compare the result with `SHA256SUMS.txt` on the release page.
 
 | What has been tested | What to expect in this beta |
 | --- | --- |
