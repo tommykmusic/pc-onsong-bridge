@@ -68,8 +68,13 @@ namespace PcOnSongBridge
         {
             if (Double.IsNegativeInfinity(peakDbFs)) return "No microphone signal. Check the selected input.";
             string level = "peak " + peakDbFs.ToString("0", System.Globalization.CultureInfo.CurrentCulture) + " dBFS";
-            return peakDbFs < -40 ? "No command recognized. The microphone was very quiet (" + level + "). Move closer or raise the input level." :
-                "No command recognized (" + level + "). Say the phrase clearly after Listening appears.";
+            if (peakDbFs < -60)
+                return "No usable microphone signal (" + level + "). Check that the mic is connected, unmuted, and selected.";
+            if (peakDbFs < -40)
+                return "No command recognized. The microphone was very quiet (" + level + "). Move closer or raise the input level.";
+            if (peakDbFs >= -1)
+                return "No command recognized. The microphone was clipping (" + level + "). Lower the input gain and try again.";
+            return "No command recognized (" + level + "). Say the phrase clearly after Listening appears.";
         }
 
         public static RecognizerInfo FindEnglishRecognizer()

@@ -65,6 +65,7 @@ namespace PcOnSongBridge
         private readonly ToolTip audioDetails = new ToolTip();
         private readonly Label blocker = Label("");
         private readonly Label setupInfo = Label("Wi-Fi playback needs the official NDI Runtime for Windows. Run setup, then return here.");
+        private readonly Label voiceInfo = Label("");
         private readonly System.Windows.Forms.Timer meter = new System.Windows.Forms.Timer { Interval = 250 };
         private string runtime;
         private bool closeRequested, released, hasSession, savedSource;
@@ -110,9 +111,7 @@ namespace PcOnSongBridge
                 try { Process.Start(new ProcessStartInfo("https://ndi.video/") { UseShellExecute = true }); }
                 catch (Exception ex) { SetStatus(ex.Message); }
             };
-            var voiceInfo = Label(ConnectSession.ConfiguredKey() == null ?
-                "To try microphone commands over Wi-Fi, open Wi-Fi voice control and enter your OnSong developer key." :
-                "For Windows microphone commands over the network, open Wi-Fi voice control. You don’t need to wait for the stream search.");
+            UpdateVoiceInfo();
             var sections = new Control[] { heading, directions, Row(sourceLabel, enterAddress), SelectRow(sources, find), addressRow, outputLabel, SelectRow(outputs, refreshOutputs),
                 setupInfo, Row(install, vendor), Row(start, stop), blocker, status, level, voiceInfo, Row(voice) };
             foreach (var c in sections) layout.Controls.Add(c);
@@ -168,8 +167,11 @@ namespace PcOnSongBridge
             voice.Click += delegate
             {
                 var source = sources.SelectedItem as NdiSource;
-                string address = Host(source == null ? preferences.WifiCueSourceAddress : source.Address);
+                string typed = tabletIp.Text.Trim();
+                string address = source != null ? Host(source.Address) :
+                    IsTabletIp(typed) ? typed : Host(preferences.WifiCueSourceAddress);
                 using (var dialog = new ConnectVoiceForm(address, microphone())) dialog.ShowDialog(this);
+                UpdateVoiceInfo();
             };
             Shown += async delegate
             {
@@ -183,6 +185,13 @@ namespace PcOnSongBridge
                 await FindAsync(opening: true);
             };
             RefreshAvailability();
+        }
+
+        private void UpdateVoiceInfo()
+        {
+            voiceInfo.Text = ConnectSession.ConfiguredKey() == null ?
+                "To try microphone commands over Wi-Fi, open Wi-Fi voice control and enter your OnSong developer key." :
+                "For Windows microphone commands over the network, open Wi-Fi voice control. You don’t need to wait for the stream search.";
         }
 
         private static string Host(string address)

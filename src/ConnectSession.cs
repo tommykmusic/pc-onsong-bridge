@@ -166,7 +166,7 @@ namespace PcOnSongBridge
                     if (rows == null) throw new InvalidOperationException("OnSong did not return the order of the current set.");
                     var ids = rows.Select(row => Text(Map(row), "ID")).ToArray();
                     if (ids.Count(s => s == song) != 1)
-                        throw new InvalidOperationException("OnSong did not identify a unique position for this song in the set.");
+                        throw new InvalidOperationException("OnSong did not identify a unique position for this song in the set (it may appear more than once in the setlist).");
                     int next = Array.IndexOf(ids, song) + (id == "next" ? 1 : -1);
                     if (next < 0 || next >= ids.Length) return next < 0 ? "Already at the first song." : "Already at the last song.";
                     targetSong = ids[next];
@@ -225,6 +225,19 @@ namespace PcOnSongBridge
             return values.TryGetValue(key, out value) ? value as string : null;
         }
 
+        private string SafeServerDetail(string reason, HttpResponseMessage response)
+        {
+            string detail = reason;
+            if (String.IsNullOrWhiteSpace(detail) && response.Headers.WwwAuthenticate != null && response.Headers.WwwAuthenticate.Count > 0)
+                detail = String.Join(", ", response.Headers.WwwAuthenticate.Select(h => h.ToString()));
+            if (String.IsNullOrWhiteSpace(detail)) return null;
+            detail = new string(detail.Trim().Where(c => !Char.IsControl(c)).ToArray());
+            if (String.IsNullOrWhiteSpace(detail)) return null;
+            if (!String.IsNullOrEmpty(developerKey) && detail.IndexOf(developerKey, StringComparison.OrdinalIgnoreCase) >= 0) return null;
+            if (!String.IsNullOrEmpty(token) && detail.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0) return null;
+            return detail.Length <= 80 ? detail : detail.Substring(0, 80) + "…";
+        }
+
         private async Task<object> Request(HttpMethod method, string route, object body, bool authenticated, string operation, CancellationToken cancel,
             bool allowAuthError = false)
         {
@@ -264,9 +277,13 @@ namespace PcOnSongBridge
                     }
                     if (allowAuthError && reason == "Not Accepting Users") return value;
                     if (accessDenied)
+                    {
+                        string detail = SafeServerDetail(reason, response);
                         throw new InvalidOperationException("OnSong refused permission to " + operation +
                             (status == 401 ? " (HTTP 401 Unauthorized)." : " (HTTP 403 Forbidden).") +
+                            (detail == null ? "" : " Server detail: " + detail + ".") +
                             " Check remote-control access with OnSong before trying again.");
+                    }
                     if (!response.IsSuccessStatusCode || (map != null && map.ContainsKey("error")))
                         throw new InvalidOperationException("OnSong declined the request to " + operation + " (HTTP " + status + ").");
                     return value;

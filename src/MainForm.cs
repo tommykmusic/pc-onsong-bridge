@@ -548,7 +548,12 @@ namespace PcOnSongBridge
                 OnUi(delegate { WriteLog(message); });
                 return;
             }
-            if (logs.TextLength > 16000) logs.Clear();
+            if (logs.TextLength > 16000)
+            {
+                string current = logs.Text;
+                int cut = current.IndexOf('\n', Math.Min(current.Length - 1, current.Length / 2));
+                logs.Text = cut >= 0 && cut + 1 < current.Length ? current.Substring(cut + 1) : "";
+            }
             logs.AppendText(DateTime.Now.ToString("HH:mm:ss", CultureInfo.InvariantCulture) + "   " + message.Trim() + Environment.NewLine);
         }
 
@@ -968,7 +973,7 @@ namespace PcOnSongBridge
                 if (closing) return;
                 activity.Text = delivery.Message;
                 if (result != null && result.SpeechEndTimestamp.HasValue)
-                    activity.Text += String.Format(CultureInfo.CurrentCulture, "  Speech end to Android receipt {0:N0} ms.",
+                    activity.Text += String.Format(CultureInfo.CurrentCulture, "  Sent to Android in {0:N0} ms (chart not verified).",
                         (delivery.Acknowledged - result.SpeechEndTimestamp.Value) * 1000.0 / Stopwatch.Frequency);
                 WriteLog("Sent " + (useVoice ? "voice" : "manual") + " command: " + action.Phrase.ToLowerInvariant() + ". " + activity.Text);
             }

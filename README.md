@@ -4,7 +4,14 @@ PC OnSong Bridge sends a tablet’s spoken song and section cues to laptop speak
 
 **[Download the Windows beta](https://github.com/tommykmusic/pc-onsong-bridge/releases/tag/v0.8.0)**. Download `PC-OnSong-Bridge-Setup.exe` from the release (it is also inside the release ZIP) and run it. The installer runs under your Windows account and needs no administrator rights.
 
-Because this beta is unsigned, Windows may show **Windows protected your PC**. To continue, choose **More info**, check that the publisher reads **Unknown publisher**, then choose **Run anyway**. To confirm the download first, run `Get-FileHash .\PC-OnSong-Bridge-Setup.exe` in PowerShell and compare the result with `SHA256SUMS.txt` on the release page.
+Because this beta is unsigned, your browser (Edge or Chrome) may warn that `PC-OnSong-Bridge-Setup.exe` isn’t commonly downloaded—choose **Keep** (or **Show more → Keep anyway**). When you run it, Windows may show **Windows protected your PC**: choose **More info**, confirm the publisher reads **Unknown publisher**, then choose **Run anyway**.
+
+<details>
+<summary>Optional: verify the download checksum before running</summary>
+
+Run `Get-FileHash .\PC-OnSong-Bridge-Setup.exe` in PowerShell and compare the result with `SHA256SUMS.txt` on the release page.
+
+</details>
 
 | What has been tested | What to expect in this beta |
 | --- | --- |
@@ -32,7 +39,9 @@ Because this beta is unsigned, Windows may show **Windows protected your PC**. T
 
 On a first install, **Choose optional components after installation** is selected. Choose **Wi-Fi cue audio** to open the NDI runtime wizard, **Android USB cues and controls** to install the verified scrcpy package with ADB, or **Voice commands** to open Windows language settings if an English desktop recognizer is missing. Choose **Set up selected**. Components already available appear as **Ready**. You can use **Open bridge** or **Finish** to proceed without downloading tools, or run the installer again to add a component later.
 
-### Wireless voice control
+### Wireless voice control (experimental — developer key required)
+
+> **Status:** For working voice commands today, use **Android USB or wireless debugging** below. Native OnSong Connect Wi-Fi voice control requires an OnSong-issued developer key, and OnSong 2026.5 for Android currently returns HTTP 401 on chart changes.
 
 **Wi-Fi voice control** uses OnSong Connect in OnSong 2026 or later. It works with USB unplugged and tablet streaming off. On the PC, open **Find my tablet → Wi-Fi voice control**. The bridge fills in the selected stream’s address or the last saved tablet address. You can also enter the tablet’s Wi-Fi address yourself.
 
@@ -132,6 +141,13 @@ In the v0.5.0 USB soundcheck on the same TCL, the Windows recognizer and bridge 
 One v0.5.0 trial in each direction used the laptop microphone and timed from the end of the musician’s phrase. For **Next song**, Android acknowledged the command at 5.09 s, screen samples showed the new chart at approximately 5.4–6.8 s, and the bridge verified its identity by 8.67 s. For **Previous song**, those measurements were 4.72 s, approximately 5.0–6.4 s, and 8.25 s. The ranges reflect USB screen sampling during this test. Run repeated trials on your own setup to measure typical performance.
 
 In a separate test, reading the tablet’s chart layout took 3.40 s. A generated “next section” phrase sent the saved keyboard shortcut, advanced within the song, and received Android acknowledgment 0.31 s after dispatch began. That interval excludes speech capture and recognition. The original chart and scroll position were restored.
+
+## Quick troubleshooting
+
+- **Browser or Windows blocks the installer:** In Edge/Chrome, choose **Keep → Show more → Keep anyway**. On the Windows SmartScreen prompt (**Windows protected your PC**), choose **More info → Run anyway**.
+- **No Wi-Fi stream found:** Confirm both devices are on the same band Wi-Fi (not a guest network with client isolation), start another search, and tap **Stop Streaming** then **Go Live** in OnSong. If discovery is blocked, click **Enter tablet address** and type the tablet’s Wi-Fi IPv4 address.
+- **Microphone not recognized, too quiet, or clipping:** Check the level reported after **Listen for command** or **Test microphone**. Below −60 dBFS usually means the mic is muted or unplugged; −60 to −40 dBFS means raise input gain or move closer; 0 dBFS means lower input gain to stop clipping. If you plug in a USB mic or mixer after opening **Wi-Fi voice control**, click **Refresh** next to the microphone picker.
+- **USB tablet not listed:** Use a USB data cable (not charge-only), turn on **Developer options → USB debugging**, unlock the tablet to accept the **Allow USB debugging** prompt, then click **Refresh tablets**.
 
 ## Build from source
 

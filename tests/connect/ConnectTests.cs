@@ -160,6 +160,10 @@ internal static class ConnectTests
         }
         string quiet = ConnectVoiceForm.ListenOnce(t => Task.FromResult(new MicrophoneResult(-52, null)), send, NoCancel).Result;
         Check(sends == 1 && quiet.Contains("very quiet") && quiet.Contains("dBFS"), "A quiet microphone did not report its level.");
+        string muted = ConnectVoiceForm.ListenOnce(t => Task.FromResult(new MicrophoneResult(-78, null)), send, NoCancel).Result;
+        Check(sends == 1 && muted.Contains("No usable microphone signal") && muted.Contains("dBFS"), "A noise-floor microphone did not warn about mute/connection.");
+        string clipped = ConnectVoiceForm.ListenOnce(t => Task.FromResult(new MicrophoneResult(0, null)), send, NoCancel).Result;
+        Check(sends == 1 && clipped.Contains("clipping") && clipped.Contains("dBFS"), "A clipping microphone did not warn to lower gain.");
         using (var source = new CancellationTokenSource())
         {
             try
@@ -175,6 +179,10 @@ internal static class ConnectTests
             (id, t) => Task.FromResult("Already at the last song."), NoCancel).Result;
         Check(timed.StartsWith("Already at the last song. Tablet response received ") && timed.EndsWith(" ms after speech ended."),
             "The response timing must preserve the tablet's actual outcome.");
+        var unconfirmed = ConnectVoiceForm.ListenOnce(t => Task.FromResult(new MicrophoneResult(-12, "next", null, speechEnd)),
+            (id, t) => Task.FromResult("Command sent. OnSong has not confirmed the new position."), NoCancel).Result;
+        Check(unconfirmed == "Command sent. OnSong has not confirmed the new position.",
+            "An unconfirmed chart change must not display a response timing figure.");
     }
     private static void CheckLoopbackRedirect(ConnectTokenStore store)
     {
@@ -309,7 +317,8 @@ internal static class ConnectTests
                 int attempts = tablet.WriteAttempts;
                 string message = Fails(() => session.SendAsync("next", NoCancel), "change the chart (HTTP " + code);
                 Check(message.Contains("remote-control access") && !message.Contains("expired") &&
-                    !message.Contains("fixture-key") && !message.Contains(tablet.Token), "Incorrect permission feedback.");
+                    !message.Contains("fixture-key") && !message.Contains(tablet.Token) &&
+                    (code != 401 || message.Contains("Server detail: Unauthorized.")), "Incorrect permission feedback.");
                 Check(tablet.WriteAttempts == attempts + 1 && !session.Approved && tablet.Index == 0 && tablet.Writes == 0,
                     "A denied chart change was retried, applied, or left control enabled.");
                 int requests = tablet.Requests;

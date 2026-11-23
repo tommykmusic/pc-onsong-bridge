@@ -13,6 +13,7 @@ namespace PcOnSongBridge
     {
         private readonly TextBox address = new TextBox();
         private readonly ComboBox microphone = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
+        private readonly Button refreshMic = new Button { Text = "Refresh" };
         private readonly Button check = new Button { Text = "Check tablet" };
         private readonly Button pair = new Button { Text = "Pair with tablet" };
         private readonly Button developerKey = new Button { Text = "Developer key…" };
@@ -58,7 +59,15 @@ namespace PcOnSongBridge
             AddRow(panel, new Label { Text = "Command microphone", AutoSize = true });
             microphone.Dock = DockStyle.Top;
             microphone.AccessibleName = "Command microphone";
-            AddRow(panel, microphone);
+            StyleButton(refreshMic);
+            refreshMic.AccessibleName = "Refresh microphones";
+            var micRow = new TableLayoutPanel { AutoSize = true, ColumnCount = 2, Dock = DockStyle.Top, Margin = Padding.Empty };
+            micRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            micRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            microphone.Margin = new Padding(0, 4, 8, 0);
+            micRow.Controls.Add(microphone, 0, 0);
+            micRow.Controls.Add(refreshMic, 1, 0);
+            AddRow(panel, micRow);
             StyleButton(listen);
             AddRow(panel, listen);
             foreach (VoiceCommand command in commands)
@@ -76,32 +85,8 @@ namespace PcOnSongBridge
             StyleButton(close);
             AddRow(panel, close);
             CancelButton = close;
-            Shown += delegate
-            {
-                try
-                {
-                    var devices = Audio.GetInputs();
-                    microphone.Items.AddRange(devices.Cast<object>().ToArray());
-                    var desired = selectedMicrophone == null ? null : devices.FirstOrDefault(d =>
-                        selectedMicrophone.EndpointId != null ? d.EndpointId == selectedMicrophone.EndpointId :
-                        d.Id == selectedMicrophone.Id && d.Name == selectedMicrophone.Name);
-                    microphone.SelectedItem = desired ?? (devices.Count == 1 ? devices[0] : null);
-                    recognizer = Audio.FindEnglishRecognizer();
-                    // Without a key, the key prompt stays as the first step.
-                    if (keyAvailable)
-                    {
-                        if (recognizer == null)
-                            status.Text = "Windows has no English desktop speech recognizer, so Listen for command is unavailable. " +
-                                "Add English speech in Windows language settings and reopen this window. Manual controls work after pairing.";
-                        else if (devices.Count == 0)
-                            status.Text = "No Windows recording input was found. Connect a microphone and reopen this window. Manual controls work after pairing.";
-                        else if (microphone.SelectedItem == null)
-                            status.Text = InitialStatus() + " Choose your command microphone before listening.";
-                    }
-                }
-                catch (Exception) { status.Text = "Windows could not list speech inputs. Manual controls are available after pairing."; }
-                UpdateEnabled();
-            };
+            Shown += delegate { RefreshMicrophones(selectedMicrophone, true); };
+            refreshMic.Click += delegate { RefreshMicrophones(microphone.SelectedItem as AudioDevice, true); };
             address.TextChanged += delegate
             {
                 if (session != null) session.Dispose();
@@ -120,6 +105,7 @@ namespace PcOnSongBridge
                 session = null;
                 keyAvailable = true;
                 status.Text = "Key saved. Choose Check tablet, then pair with your tablet.";
+                ApplySpeechDiagnostics(false);
                 UpdateEnabled();
             };
             check.Click += async (s, e) => await Run(async token =>
@@ -148,6 +134,39 @@ namespace PcOnSongBridge
         private const string KeyNeeded = "Choose Developer key to set up Wi-Fi voice control. Wi-Fi cue audio works independently.";
         private string InitialStatus() { return keyAvailable ? "Check the address, then pair with the tablet on your trusted Wi-Fi network." : KeyNeeded; }
 
+        private void RefreshMicrophones(AudioDevice preferred, bool replaceStatus)
+        {
+            try
+            {
+                var devices = Audio.GetInputs();
+                microphone.Items.Clear();
+                microphone.Items.AddRange(devices.Cast<object>().ToArray());
+                var desired = preferred == null ? null : devices.FirstOrDefault(d =>
+                    preferred.EndpointId != null ? d.EndpointId == preferred.EndpointId :
+                    d.Id == preferred.Id && d.Name == preferred.Name);
+                microphone.SelectedItem = desired ?? (devices.Count == 1 ? devices[0] : null);
+                recognizer = Audio.FindEnglishRecognizer();
+                ApplySpeechDiagnostics(replaceStatus);
+            }
+            catch (Exception) { status.Text = "Windows could not list speech inputs. Manual controls are available after pairing."; }
+            UpdateEnabled();
+        }
+
+        private void ApplySpeechDiagnostics(bool replaceStatus)
+        {
+            // Without a key, the key prompt stays as the first step.
+            if (!keyAvailable) return;
+            if (recognizer == null)
+                status.Text = "Windows has no English desktop speech recognizer, so Listen for command is unavailable. " +
+                    "Add English speech in Windows language settings and click Refresh. Manual controls work after pairing.";
+            else if (microphone.Items.Count == 0)
+                status.Text = "No Windows recording input was found. Connect a microphone and click Refresh. Manual controls work after pairing.";
+            else if (microphone.SelectedItem == null)
+                status.Text = (replaceStatus ? InitialStatus() : status.Text) + " Choose your command microphone before listening.";
+            else if (replaceStatus && status.Text.StartsWith("No Windows recording input", StringComparison.Ordinal))
+                status.Text = InitialStatus();
+        }
+
         private static void AddRow(TableLayoutPanel panel, Control control)
         {
             int row = panel.RowCount++;
@@ -172,7 +191,7 @@ namespace PcOnSongBridge
             check.Enabled = idle && !String.IsNullOrWhiteSpace(address.Text);
             pair.Enabled = idle && keyAvailable && session != null && session.TabletName != null && !approved;
             developerKey.Enabled = idle;
-            address.Enabled = microphone.Enabled = idle;
+            address.Enabled = microphone.Enabled = refreshMic.Enabled = idle;
             manual.Enabled = idle && approved;
             listen.Enabled = listening || (idle && approved && recognizer != null && microphone.SelectedItem is AudioDevice);
             listen.Text = listening ? "Cancel" : "Listen for command";
@@ -209,7 +228,7 @@ namespace PcOnSongBridge
             if (String.IsNullOrEmpty(sample.Command)) return Audio.NoCommandMessage(sample.PeakDbFs) +
                 (Double.IsNegativeInfinity(sample.PeakDbFs) ? "" : " Press Listen for command to try again.");
             string reply = await send(sample.Command, token);
-            if (!sample.SpeechEndTimestamp.HasValue) return reply;
+            if (!sample.SpeechEndTimestamp.HasValue || reply.IndexOf("has not confirmed", StringComparison.OrdinalIgnoreCase) >= 0) return reply;
             double elapsedMs = (Stopwatch.GetTimestamp() - sample.SpeechEndTimestamp.Value) * 1000.0 / Stopwatch.Frequency;
             return String.Format("{0} Tablet response received {1:N0} ms after speech ended.", reply, elapsedMs);
         }

@@ -157,6 +157,8 @@ namespace PcOnSongBridge
             private int position;
             private bool complete;
             private int peak;
+            private int blocks;
+            private int ambientPeak;
             internal int LastActivity { get; private set; }
             internal int QuietMilliseconds { get { return (written - LastActivity) * 1000 / (SpeechSampleRate * 2); } }
             internal long RecordedTicks { get { return written * (long)Stopwatch.Frequency / (SpeechSampleRate * 2); } }
@@ -175,6 +177,11 @@ namespace PcOnSongBridge
                 for (int offset = 0; offset + 1 < pcm.Length; offset += 2)
                     blockPeak = Math.Max(blockPeak, Math.Abs((int)ReadSample(pcm, offset)));
                 peak = Math.Max(blockPeak, peak);
+                if (blocks < 5)
+                {
+                    blocks++;
+                    ambientPeak = Math.Max(ambientPeak, Math.Min(blockPeak, 600));
+                }
                 lock (sync)
                 {
                     int previous = 0;
@@ -189,9 +196,9 @@ namespace PcOnSongBridge
                         data[written++] = (byte)(sample >> 8);
                         previous = next;
                     }
-                    // Accelerate only when the trailing blocks are very quiet relative to the speech.
-                    // A noisy microphone remains on SAPI's regular streaming endpoint.
-                    if (blockPeak > Math.Max(24, Math.Min(180, peak / 100))) LastActivity = written;
+                    // Accelerate when trailing blocks drop near silence or back to the initial room floor.
+                    int floor = peak > ambientPeak * 3 ? Math.Min(1200, ambientPeak * 2) : 0;
+                    if (blockPeak > Math.Max(24, Math.Max(floor, Math.Min(180, peak / 100)))) LastActivity = written;
                     Monitor.PulseAll(sync);
                 }
             }
