@@ -114,7 +114,7 @@ internal static class ConnectTests
                 form.ShowInTaskbar = false; form.Opacity = 0; form.Show();
                 var controls = Descendants(form).ToArray();
                 Check(controls.OfType<Button>().Single(b => b.Text == "Check tablet").Enabled &&
-                    !controls.OfType<Button>().Single(b => b.Text == "Listen for command").Enabled &&
+                    !controls.OfType<Button>().Single(b => b.Text == "Start listening").Enabled &&
                     !controls.OfType<Button>().Single(b => b.Text == "Pair with tablet").Enabled &&
                     controls.OfType<Button>().Any(b => b.Text == "Developer key…" && b.Enabled) &&
                     controls.OfType<Label>().Any(l => l.Text.Contains("Choose Developer key")), "Missing key state inaccessible.");
@@ -134,6 +134,7 @@ internal static class ConnectTests
                     "Saved key failed to round trip or override the environment fallback.");
             }
             CheckMicrophoneHints(keyStore);
+            CheckHandsFreeToggle(keyStore, store);
             using (var stored = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(settingsPath, true))
             {
                 byte[] encrypted = (byte[])stored.GetValue("DeveloperKey");
@@ -147,8 +148,8 @@ internal static class ConnectTests
             Microsoft.Win32.Registry.CurrentUser.DeleteSubKey(settingsPath, false);
             Environment.SetEnvironmentVariable(ConnectSession.KeyVariable, originalKey);
         }
-        CheckSingleListen();
-        Console.WriteLine("PASS keyless dialog and one phrase per press, no-match, silent input, and cancellation");
+        CheckCommandFeedback();
+        Console.WriteLine("PASS keyless dialog, microphone input feedback, confirmed timing and unchanged-chart boundaries");
     }
 
     private static void CheckMicrophoneHints(ConnectKeyStore keyStore)
@@ -180,48 +181,119 @@ internal static class ConnectTests
         }
     }
 
-    private static void CheckSingleListen()
+    private static async Task WaitFor(Func<bool> ready, string message)
     {
-        int captures = 0, sends = 0;
-        Func<CancellationToken, Task<MicrophoneResult>> sample = delegate { captures++; return Task.FromResult(new MicrophoneResult(-12, "next")); };
-        Func<string, CancellationToken, Task<ConnectCommandResult>> send = (id, token) => { sends++; return Task.FromResult(new ConnectCommandResult(id)); };
-        Check(ConnectVoiceForm.ListenOnce(sample, send, NoCancel).Result == "next" && captures == 1 && sends == 1, "One press did not produce one command.");
-        foreach (double peak in new[] { -15.0, Double.NegativeInfinity })
+        var timer = Stopwatch.StartNew();
+        while (!ready() && timer.ElapsedMilliseconds < 5000) await Task.Delay(10);
+        Check(ready(), message);
+    }
+
+    private static void CheckHandsFreeToggle(ConnectKeyStore keyStore, ConnectTokenStore tokenStore)
+    {
+        var recognizer = Audio.FindEnglishRecognizer();
+        if (recognizer == null) { Console.WriteLine("SKIP Wi-Fi voice toggle UI: no English SAPI engine"); return; }
+        var tablet = new Tablet { AndroidAuth = true, Registered = true };
+        var mic = new AudioDevice(1, "Talkback fixture");
+        var phrases = new Queue<MicrophoneResult>();
+        Action lastReady = null;
+        int starts = 0, captures = 0;
+        HandsFreeSession fixture = (device, engine, commands, ready, dispatch, noMatch, cancel) =>
         {
-            var result = ConnectVoiceForm.ListenOnce(t => Task.FromResult(new MicrophoneResult(peak, null)), send, NoCancel).Result;
-            Check(sends == 1 && result.StartsWith(Double.IsNegativeInfinity(peak) ? "No microphone signal" : "No command recognized"),
-                "Unrecognized input dispatched a command.");
+            Check(device == mic && engine == recognizer && commands.Length == 4, "Wrong Wi-Fi talkback configuration.");
+            starts++;
+            lastReady = ready;
+            ready();
+            return HandsFreeListening.RunAsync(async token =>
+            {
+                captures++;
+                await Task.Yield();
+                if (phrases.Count > 0) return phrases.Dequeue();
+                await Task.Delay(Timeout.Infinite, token);
+                throw new Exception("Canceled capture resumed.");
+            }, dispatch, noMatch, cancel);
+        };
+        using (var form = new ConnectVoiceForm(Endpoint.Host, null, keyStore, fixture,
+            (address, keys) => new ConnectSession(Endpoint, "fixture-key", tokenStore, tablet)))
+        {
+            Exception failure = null;
+            form.ShowInTaskbar = false; form.Opacity = 0;
+            form.Shown += async delegate
+            {
+                try
+                {
+                    form.SetSpeechInputs(new List<AudioDevice> { mic }, recognizer, mic);
+                    var controls = Descendants(form).ToArray();
+                    var pair = controls.OfType<Button>().Single(b => b.Text == "Pair with tablet");
+                    var toggle = controls.OfType<Button>().Single(b => b.Text == "Start listening");
+                    var status = controls.OfType<Label>().Single(l => l.AccessibleName != null && l.AccessibleName.StartsWith("Wi-Fi voice control."));
+                    var hint = controls.OfType<Label>().Single(l => l.AccessibleName == "Microphone availability");
+                    var hints = new List<string>();
+                    hint.TextChanged += delegate { hints.Add(hint.Text); };
+                    controls.OfType<Button>().Single(b => b.Text == "Check tablet").PerformClick();
+                    await WaitFor(() => pair.Enabled, "Tablet check failed.");
+                    pair.PerformClick();
+                    await WaitFor(() => toggle.Enabled, "Fixture pairing failed.");
+                    phrases.Enqueue(new MicrophoneResult(-12, "next", null, Stopwatch.GetTimestamp()));
+                    phrases.Enqueue(new MicrophoneResult(-52, null));
+                    phrases.Enqueue(new MicrophoneResult(Double.NegativeInfinity, null));
+                    phrases.Enqueue(new MicrophoneResult(-12, "previous", null, Stopwatch.GetTimestamp()));
+                    toggle.PerformClick();
+                    await WaitFor(() => captures == 5 || toggle.Text == "Start listening", "One press did not rearm.");
+                    Check(captures == 5, "Listening ended after " + captures + " reads: " + status.Text);
+                    Check(toggle.Enabled && toggle.Text == "Stop listening" && starts == 1 && tablet.Writes == 2 && tablet.Index == 0 &&
+                        hints.Any(s => s.Contains("very quiet")) && status.Text.Contains("previous song") && status.Text.Contains("confirmation received"),
+                        "Wi-Fi talkback did not keep command feedback or return to the starting chart.");
+                    toggle.PerformClick();
+                    await WaitFor(() => toggle.Enabled && toggle.Text == "Start listening", "Pressing Stop did not rearm the toggle.");
+                    lastReady();
+                    Check(!hint.Visible && tablet.WriteAttempts == 2 && !status.Text.Contains("Sending"), "A late callback rearmed stopped listening.");
+
+                    tablet.RefuseWriteStatus = 401;
+                    phrases.Enqueue(new MicrophoneResult(-12, "next"));
+                    toggle.PerformClick();
+                    await WaitFor(() => pair.Enabled, "A permission refusal did not stop the listener and allow re-pairing.");
+                    Check(!toggle.Enabled && toggle.Text == "Start listening" && tablet.WriteAttempts == 3 && status.Text.Contains("HTTP 401"),
+                        "Refused write was retried or left the microphone enabled.");
+                    pair.PerformClick();
+                    await WaitFor(() => toggle.Enabled, "Fixture could not re-pair.");
+                    toggle.PerformClick();
+                    await WaitFor(() => starts == 3 && toggle.Text == "Stop listening", "Listener failed to start again.");
+                }
+                catch (Exception error) { failure = error; }
+                finally { form.Close(); }
+            };
+            Application.Run(form);
+            if (failure != null) throw new Exception("Wi-Fi voice toggle failed.", failure);
+            Check(form.IsDisposed, "Close did not cancel and release the listener.");
+            lastReady();
+            Check(tablet.WriteAttempts == 3, "Closing issued a command.");
         }
-        string quiet = ConnectVoiceForm.ListenOnce(t => Task.FromResult(new MicrophoneResult(-52, null)), send, NoCancel).Result;
-        Check(sends == 1 && quiet.Contains("very quiet") && quiet.Contains("dBFS"), "A quiet microphone did not report its level.");
-        string muted = ConnectVoiceForm.ListenOnce(t => Task.FromResult(new MicrophoneResult(-78, null)), send, NoCancel).Result;
-        Check(sends == 1 && muted.Contains("No usable microphone signal") && muted.Contains("dBFS"), "A noise-floor microphone did not warn about mute/connection.");
+        Console.WriteLine("PASS Wi-Fi voice toggle through next, quiet input, silence and previous, manual stop, refused write, restart and close");
+    }
+
+    private static void CheckCommandFeedback()
+    {
+        Check(Audio.NoCommandMessage(-15).StartsWith("No command recognized") &&
+            Audio.NoCommandMessage(Double.NegativeInfinity).StartsWith("No microphone signal"), "Missing input feedback.");
+        string quiet = Audio.NoCommandMessage(-52), muted = Audio.NoCommandMessage(-78);
+        Check(quiet.Contains("very quiet") && quiet.Contains("dBFS"), "A quiet microphone did not report its level.");
+        Check(muted.Contains("No usable microphone signal") && muted.Contains("dBFS"), "A noise-floor microphone did not warn about mute/connection.");
         foreach (double peak in new[] { -1.0, -0.5, 0.0 })
         {
-            string high = ConnectVoiceForm.ListenOnce(t => Task.FromResult(new MicrophoneResult(peak, null)), send, NoCancel).Result;
-            Check(sends == 1 && high.Contains("near full scale") && high.Contains("dBFS") && high.Contains("Lower the input gain"),
+            string high = Audio.NoCommandMessage(peak);
+            Check(high.Contains("near full scale") && high.Contains("dBFS") && high.Contains("Lower the input gain"),
                 "Near-full-scale input did not show its level and gain guidance.");
         }
         Check(!Audio.NoCommandMessage(-1.1).Contains("near full scale"), "High-level guidance appeared below its threshold.");
-        using (var source = new CancellationTokenSource())
-        {
-            try
-            {
-                ConnectVoiceForm.ListenOnce(t => { source.Cancel(); return sample(t); }, send, source.Token).GetAwaiter().GetResult();
-                throw new Exception("A canceled listen completed.");
-            }
-            catch (OperationCanceledException) { }
-            Check(sends == 1, "Canceled recognition dispatched a command.");
-        }
         long speechEnd = Stopwatch.GetTimestamp() - Stopwatch.Frequency / 5;
-        Func<CancellationToken, Task<MicrophoneResult>> timedSample = t => Task.FromResult(new MicrophoneResult(-12, "next", null, speechEnd));
+        var timedSample = new MicrophoneResult(-12, "next", null, speechEnd);
         var confirmed = new ConnectCommandResult("OnSong confirmed the song change.", speechEnd + Stopwatch.Frequency / 10);
-        var timed = ConnectVoiceForm.ListenOnce(timedSample, (id, t) => Task.FromResult(confirmed), NoCancel).Result;
+        var timed = ConnectVoiceForm.FormatReply(timedSample, confirmed);
         Check(timed == "OnSong confirmed the song change. Tablet confirmation received 100 ms after speech ended.",
             "Use the tablet readback timestamp to measure confirmation.");
         foreach (var message in new[] { "Already at the last song.", "Command sent. OnSong has not confirmed the new position." })
         {
-            var result = ConnectVoiceForm.ListenOnce(timedSample, (id, t) => Task.FromResult(new ConnectCommandResult(message)), NoCancel).Result;
+            var result = ConnectVoiceForm.FormatReply(timedSample, new ConnectCommandResult(message));
             Check(result == message, "An unchanged or unconfirmed chart displayed a timing figure.");
         }
     }

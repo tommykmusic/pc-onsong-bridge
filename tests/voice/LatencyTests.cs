@@ -7,6 +7,7 @@ using System.Speech.AudioFormat;
 using System.Speech.Recognition;
 using System.Speech.Synthesis;
 using System.Threading;
+using System.Threading.Tasks;
 using PcOnSongBridge;
 
 internal static class LatencyTests
@@ -81,6 +82,91 @@ internal static class LatencyTests
         double delay = Measure("streaming on the selected stereo channel", Say(synth, "next song"), "next",
             VoiceCommands.SongCommands, recognizer, 48000, 2, 1);
         if (delay >= 800) throw new InvalidOperationException("Live recognition waited for the fixed capture window.");
+        CheckHandsFree(synth, recognizer);
+        CheckHandsFreeInputFailure(Say(synth, "next song"), recognizer);
+    }
+
+    private static void CheckHandsFreeInputFailure(byte[] spoken, RecognizerInfo recognizer)
+    {
+        var audio = new byte[300 * 32].Concat(spoken).ToArray();
+        int blocks = (audio.Length + BytesPerBlock - 1) / BytesPerBlock;
+        var unplugged = new IOException("Simulated talkback microphone disconnect.");
+        int lost = 0, lateDispatches = 0;
+        try
+        {
+            Task.Run(() => Audio.RunHandsFreeInputAsync(recognizer, VoiceCommands.SongCommands, (accept, start, token) =>
+            {
+                // End the device stream at the last syllable, while SAPI still holds the utterance.
+                Pace(audio, blocks * Audio.BlockMilliseconds, accept, token, start: start);
+                Interlocked.Exchange(ref lost, 1);
+                throw unplugged;
+            }, () => { }, (result, token) =>
+            {
+                if (Volatile.Read(ref lost) != 0) Interlocked.Increment(ref lateDispatches);
+                return Task.FromResult(0);
+            }, result => { }, CancellationToken.None)).GetAwaiter().GetResult();
+            throw new Exception("Microphone failure was swallowed.");
+        }
+        catch (IOException error) { if (error != unplugged) throw; }
+        if (lateDispatches != 0) throw new InvalidOperationException("A final recognizer result was dispatched after the mic failed.");
+
+        int ready = 0;
+        try
+        {
+            Task.Run(() => Audio.RunHandsFreeInputAsync(recognizer, VoiceCommands.SongCommands, (accept, start, token) => { },
+                () => ready++, (result, token) => { throw new Exception("Empty input dispatched a command."); },
+                result => { }, CancellationToken.None)).GetAwaiter().GetResult();
+            throw new Exception("A microphone that never opened was accepted.");
+        }
+        catch (InvalidOperationException) { }
+        if (ready != 0) throw new InvalidOperationException("The listener reported ready before the microphone opened.");
+        Console.WriteLine("PASS a microphone disconnect discards the final utterance and an unopened input never reports ready.");
+    }
+
+    private static void CheckHandsFree(SpeechSynthesizer synth, RecognizerInfo recognizer)
+    {
+        var audio = new List<byte>(new byte[2250 * 32]);
+        var ends = new List<double>();
+        foreach (string phrase in new[] { "next song", "bring the bass guitar up a little", "previous song", "next song" })
+        {
+            audio.AddRange(Say(synth, phrase));
+            if (phrase.EndsWith("song", StringComparison.Ordinal)) ends.Add(audio.Count / 32.0);
+            audio.AddRange(new byte[(phrase.StartsWith("bring") ? 4800 : 700) * 32]);
+        }
+        var pcm = audio.ToArray();
+        var received = new List<string>();
+        var delays = new List<double>();
+        int opens = 0, ready = 0;
+        long origin = 0;
+        using (var stop = new CancellationTokenSource(TimeSpan.FromSeconds(22)))
+        {
+            try
+            {
+                Task.Run(() => Audio.RunHandsFreeInputAsync(recognizer, VoiceCommands.SongCommands, (accept, start, token) =>
+                {
+                    Interlocked.Increment(ref opens);
+                    Pace(pcm, pcm.Length / 32 + 1800, accept, token, 48000, 2, 1, false, t =>
+                    {
+                        origin = t;
+                        start(t);
+                    });
+                }, () => ready++, (result, token) =>
+                {
+                    int i = received.Count;
+                    received.Add(result.Command);
+                    if (i < ends.Count) delays.Add((Stopwatch.GetTimestamp() - origin) * 1000.0 / Stopwatch.Frequency - ends[i]);
+                    if (received.Count == ends.Count) stop.Cancel();
+                    return Task.FromResult(0);
+                }, unmatched => { }, stop.Token)).GetAwaiter().GetResult();
+            }
+            catch (OperationCanceledException) { if (!stop.IsCancellationRequested) throw; }
+        }
+        if (opens != 1 || ready != 1 || !received.SequenceEqual(new[] { "next", "previous", "next" }))
+            throw new InvalidOperationException("Continuous recognition returned unexpected commands: " + String.Join(", ", received));
+        if (delays.Any(d => d < 0 || d > 1000))
+            throw new InvalidOperationException("Unexpected continuous recognition latency: " + String.Join(", ", delays));
+        Console.WriteLine("PASS continuous stereo talkback: one mic open, three commands, ordinary speech, extended silence and stop. Waveform end to dispatch: {0} ms.",
+            String.Join(", ", delays.Select(d => d.ToString("0"))));
     }
 
     private static void CheckSingleCommand(byte[] first, byte[] second, RecognizerInfo recognizer, VoiceCommand[] commands)
@@ -167,13 +253,14 @@ internal static class LatencyTests
     }
 
     private static long Pace(byte[] audio, int window, Func<byte[], uint, ushort, bool> receive, CancellationToken token,
-        int sampleRate = Rate, ushort channels = 1, int activeChannel = 0, bool backgroundNoise = false)
+        int sampleRate = Rate, ushort channels = 1, int activeChannel = 0, bool backgroundNoise = false, Action<long> start = null)
     {
         var block = new byte[BytesPerBlock];
         var frames = sampleRate * Audio.BlockMilliseconds / 1000;
         var mixer = new byte[frames * channels * 2];
         var noise = new Random(98341);
         long started = Stopwatch.GetTimestamp();
+        if (start != null) start(started);
         for (int elapsed = Audio.BlockMilliseconds; elapsed <= window; elapsed += Audio.BlockMilliseconds)
         {
             int offset = (elapsed / Audio.BlockMilliseconds - 1) * block.Length;

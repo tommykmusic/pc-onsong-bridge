@@ -24,8 +24,10 @@ namespace PcOnSongBridge
         private static readonly Color Alert = Color.FromArgb(255, 188, 142);
         private const int HotkeyId = 91;
         private const int HotkeyMessage = 0x0312;
+        private const uint ModNoRepeat = 0x4000;
 
         private readonly Preferences settings;
+        private readonly HandsFreeSession liveVoice;
         private readonly TextBox path = Field();
         private readonly ComboBox devices = Picker();
         private readonly Dictionary<string, string> tabletLabels = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -63,8 +65,7 @@ namespace PcOnSongBridge
         private readonly Button testCommands = MakeButton("Command library and tests");
         private readonly Button previous = MakeButton("Previous song");
         private readonly Button next = MakeButton("Next song");
-        private readonly Button listen = MakeButton("Listen for command", true);
-        private readonly Button cancel = MakeButton("Cancel");
+        private readonly Button listen = MakeButton("Start listening", true);
         private AndroidBridge bridge;
         private CancellationTokenSource navigationOperation;
         private CommandLibraryForm commandTest;
@@ -76,7 +77,8 @@ namespace PcOnSongBridge
         private string pendingWirelessEndpoint;
         private string pendingWirelessService;
         private bool busy;
-        private bool sending;
+        private bool listening;
+        private bool microphoneOpen;
         private bool tonePlaying;
         private bool startingAudio;
         private bool stopping;
@@ -92,9 +94,10 @@ namespace PcOnSongBridge
 
         internal MainForm(Preferences preferences) : this(preferences, null) { }
 
-        internal MainForm(Preferences preferences, Func<WifiCueServices> wifiServices)
+        internal MainForm(Preferences preferences, Func<WifiCueServices> wifiServices, HandsFreeSession liveVoice = null)
         {
             settings = preferences;
+            this.liveVoice = liveVoice;
             this.wifiServices = wifiServices ?? (() => new WifiCueServices());
             Text = "PC OnSong Bridge v" + BridgeRelease.Version;
             StartPosition = FormStartPosition.CenterScreen;
@@ -125,7 +128,7 @@ namespace PcOnSongBridge
             buffer.Width = 64;
             buffer.BackColor = ControlBackground;
             buffer.ForeColor = Foreground;
-            hotkey.Text = "Enable global F8";
+            hotkey.Text = "Use global F8 to toggle listening";
             hotkey.AutoSize = true;
             hotkey.Margin = new Padding(12, 6, 4, 2);
             hotkey.ForeColor = Secondary;
@@ -160,7 +163,6 @@ namespace PcOnSongBridge
             previous.Click += async delegate { await NavigateAsync("previous"); };
             next.Click += async delegate { await NavigateAsync("next"); };
             listen.Click += async delegate { await NavigateAsync(null); };
-            cancel.Click += delegate { CancelNavigation(); };
             hotkey.CheckedChanged += delegate { SetHotkey(hotkey.Checked); };
             devices.SelectedIndexChanged += delegate
             {
@@ -172,7 +174,11 @@ namespace PcOnSongBridge
                 InvalidateNavigation();
             };
             navigation.SelectedIndexChanged += delegate { InvalidateNavigation(); };
-            input.SelectedIndexChanged += delegate { UpdateControls(); };
+            input.SelectedIndexChanged += delegate
+            {
+                if (listening) CancelNavigation();
+                UpdateControls();
+            };
             routeTimer.Tick += async delegate { await CheckRouteAsync(); };
             output.SelectedIndexChanged += async delegate
             {
@@ -251,7 +257,7 @@ namespace PcOnSongBridge
             voice.Controls.Add(LabeledRow("Microphone", input, testMic));
             voice.Controls.Add(LabeledRow("Tablet control", navigation, verify));
             voice.Controls.Add(Buttons(testCommands, previous, next));
-            voice.Controls.Add(Buttons(listen, cancel, hotkey));
+            voice.Controls.Add(Buttons(listen, hotkey));
             voice.Controls.Add(speechStatus);
             voice.Controls.Add(activity);
             page.Controls.Add(voice);
@@ -413,9 +419,25 @@ namespace PcOnSongBridge
             verify.Enabled = selected && idle && !stopping;
             previous.Enabled = canNavigate;
             next.Enabled = canNavigate;
-            hotkey.Enabled = recognizer != null;
-            listen.Enabled = canNavigate && recognizer != null && input.SelectedItem != null && !tonePlaying;
-            cancel.Enabled = navigating && !sending && !navigationOperation.IsCancellationRequested;
+            bool speechAvailable = recognizer != null || liveVoice != null;
+            bool stoppingListener = listening && navigationOperation.IsCancellationRequested;
+            hotkey.Enabled = speechAvailable;
+            listen.Enabled = listening ? !stoppingListener : canNavigate && speechAvailable && input.SelectedItem != null && !tonePlaying;
+            listen.Text = stoppingListener ? "Stopping…" : listening ? "Stop listening" : "Start listening";
+            speechStatus.ForeColor = listening ? Accent : Secondary;
+            if (listening)
+            {
+                speechStatus.Text = stoppingListener ? "Stopping listening…" : microphoneOpen
+                    ? "Listening on " + input.SelectedItem + "." : "Opening microphone…";
+            }
+            else if (!speechAvailable)
+                speechStatus.Text = "Install an English desktop speech recognizer in Windows, then refresh audio devices.";
+            else if (!selected || !navigationChecked)
+                speechStatus.Text = "Select your tablet and choose Check navigation to enable listening.";
+            else if (input.SelectedItem == null)
+                speechStatus.Text = "Select your talkback microphone to enable listening.";
+            else
+                speechStatus.Text = "Listening is off. Start listening to use voice commands.";
         }
 
         private void SetStatus(string message, Color color)
@@ -766,15 +788,7 @@ namespace PcOnSongBridge
             recognizer = null;
             try { recognizer = Audio.FindEnglishRecognizer(); }
             catch (Exception error) { WriteLog("Windows could not list speech recognizers. " + error.Message); }
-            if (recognizer == null)
-            {
-                hotkey.Checked = false;
-                speechStatus.Text = "Install an English desktop speech recognizer in Windows, then refresh audio devices.";
-            }
-            else
-            {
-                speechStatus.Text = recognizer.Culture.EnglishName + " desktop recognizer available.";
-            }
+            if (recognizer == null) hotkey.Checked = false;
             UpdateControls();
             try
             {
@@ -870,6 +884,7 @@ namespace PcOnSongBridge
         private void InvalidateNavigation()
         {
             navigationRevision++;
+            if (listening) CancelNavigation();
             if (commandTest != null && !commandTest.IsDisposed) commandTest.Close();
             if (navigationChecked)
                 activity.Text = "Check navigation again before listening.";
@@ -935,61 +950,82 @@ namespace PcOnSongBridge
         private async Task NavigateAsync(string command)
         {
             bool useVoice = command == null;
-            if (closing || !(useVoice ? listen.Enabled : next.Enabled)) return;
+            if (closing) return;
+            if (useVoice && listening)
+            {
+                if (!navigationOperation.IsCancellationRequested) CancelNavigation();
+                return;
+            }
+            if (!(useVoice ? listen.Enabled : next.Enabled)) return;
             string serial = Serial;
             if (serial != verifiedSerial) return;
             var operation = new CancellationTokenSource();
+            CancellationToken token = operation.Token;
             navigationOperation = operation;
+            listening = useVoice;
+            UpdateControls();
             try
             {
                 TabletControlMode mode = (TabletControlMode)navigation.SelectedIndex;
-                var commands = VoiceCommands.ForMode(mode, settings.VoiceBindings);
-                MicrophoneResult result = null;
-                if (useVoice)
+                VoiceCommand[] commands = VoiceCommands.ForMode(mode, settings.VoiceBindings).ToArray();
+                if (!useVoice)
                 {
-                    activity.Text = "Opening microphone…";
-                    UpdateControls();
-                    result = await Audio.TestMicrophoneAsync((AudioDevice)input.SelectedItem, recognizer, commands, operation.Token,
-                        () => OnUi(delegate {
-                            if (navigationOperation == operation && !operation.IsCancellationRequested && !sending)
-                                activity.Text = "Listening… say a ready phrase from the command library.";
-                        }));
-                    operation.Token.ThrowIfCancellationRequested();
-                    command = result.Command;
-                    if (String.IsNullOrEmpty(command))
-                    {
-                        activity.Text = Double.IsNegativeInfinity(result.PeakDbFs)
-                            ? "No microphone signal. Check the selected input with Test microphone."
-                            : Audio.NoCommandMessage(result.PeakDbFs);
-                        WriteLog(activity.Text);
-                        return;
-                    }
+                    await SendNavigationAsync(serial, commands.First(item => item.Id == command), mode, null, token);
+                    return;
                 }
-                VoiceCommand action = commands.First(item => item.Id == command);
-                sending = true;
-                activity.Text = "Sending “" + action.Phrase + "”…";
-                UpdateControls();
-                CommandDelivery delivery = await DispatchAsync(serial, action, mode, false, operation.Token);
-                if (closing) return;
-                activity.Text = delivery.Message;
-                if (result != null && result.SpeechEndTimestamp.HasValue)
-                    activity.Text += String.Format(CultureInfo.CurrentCulture, "  Sent to Android in {0:N0} ms (chart not verified).",
-                        (delivery.Acknowledged - result.SpeechEndTimestamp.Value) * 1000.0 / Stopwatch.Frequency);
-                WriteLog("Sent " + (useVoice ? "voice" : "manual") + " command: " + action.Phrase.ToLowerInvariant() + ". " + activity.Text);
+                HandsFreeSession run = liveVoice ?? Audio.ListenHandsFreeAsync;
+                activity.Text = "Say a ready phrase from the command library.";
+                await run((AudioDevice)input.SelectedItem, recognizer, commands,
+                    delegate
+                    {
+                        if (closing || navigationOperation != operation || token.IsCancellationRequested) return;
+                        microphoneOpen = true;
+                        UpdateControls();
+                    },
+                    (sample, dispatchToken) =>
+                    {
+                        token.ThrowIfCancellationRequested();
+                        return SendNavigationAsync(serial, commands.First(item => item.Id == sample.Command),
+                            mode, sample, dispatchToken);
+                    },
+                    sample =>
+                    {
+                        if (!closing && !token.IsCancellationRequested && sample.PeakDbFs >= -1)
+                            activity.Text = Audio.NoCommandMessage(sample.PeakDbFs);
+                    }, token);
             }
-            catch (OperationCanceledException) { if (!closing) activity.Text = "Navigation canceled."; }
+            catch (OperationCanceledException)
+            {
+                if (!closing && navigationChecked) activity.Text = useVoice ? "Listening stopped." : "Navigation canceled.";
+            }
             catch (Exception error)
             {
-                if (!closing) activity.Text = "Navigation failed. " + (error.Message.Length <= 150 ? error.Message : "See Activity.");
+                if (!closing) activity.Text = (useVoice ? "Listening stopped. " : "Navigation failed. ") +
+                    (error.Message.Length <= 150 ? error.Message : "See Activity.");
                 WriteLog(error.Message);
             }
             finally
             {
-                sending = false;
+                listening = false;
+                microphoneOpen = false;
                 navigationOperation = null;
                 operation.Dispose();
                 if (!closing) UpdateControls();
             }
+        }
+
+        private async Task SendNavigationAsync(string serial, VoiceCommand action, TabletControlMode mode,
+            MicrophoneResult sample, CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+            activity.Text = "Sending “" + action.Phrase + "”…";
+            CommandDelivery delivery = await DispatchAsync(serial, action, mode, false, token);
+            if (closing) return;
+            activity.Text = delivery.Message;
+            if (sample != null && sample.SpeechEndTimestamp.HasValue)
+                activity.Text += String.Format(CultureInfo.CurrentCulture, "  Sent to Android in {0:N0} ms (chart not verified).",
+                    (delivery.Acknowledged - sample.SpeechEndTimestamp.Value) * 1000.0 / Stopwatch.Frequency);
+            WriteLog("Sent " + (sample != null ? "voice" : "manual") + " command: " + action.Phrase.ToLowerInvariant() + ". " + activity.Text);
         }
 
         private Task<CommandDelivery> DispatchAsync(string serial, VoiceCommand command, TabletControlMode mode, bool observe,
@@ -1005,18 +1041,21 @@ namespace PcOnSongBridge
         {
             if (commandTest != null && !commandTest.IsDisposed) commandTest.CancelPending();
             if (navigationOperation != null)
+            {
                 navigationOperation.Cancel();
+                if (!closing) UpdateControls();
+            }
         }
 
         private void SetHotkey(bool enabled)
         {
             if (enabled && !hotkeyRegistered)
             {
-                hotkeyRegistered = RegisterHotKey(Handle, HotkeyId, 0x4000, (uint)Keys.F8);
+                hotkeyRegistered = RegisterHotKey(Handle, HotkeyId, ModNoRepeat, (uint)Keys.F8);
                 if (!hotkeyRegistered)
                 {
                     hotkey.Checked = false;
-                    WriteLog("Windows could not register F8. Use Listen for command.");
+                    WriteLog("Windows could not register F8. Use the listening button.");
                 }
             }
             else if (!enabled && hotkeyRegistered)
@@ -1030,8 +1069,13 @@ namespace PcOnSongBridge
         {
             if (message.Msg == HotkeyMessage && message.WParam.ToInt32() == HotkeyId)
             {
-                if (!closing && !busy && !OwnedForms.Any(form => form.Modal || form.OwnedForms.Any(child => child.Modal)))
-                    BeginInvoke(new Action(async delegate { await NavigateAsync(null); }));
+                if (hotkeyRegistered && !closing)
+                    BeginInvoke(new Action(async delegate
+                    {
+                        if (!hotkeyRegistered || closing) return;
+                        if (listening || (!busy && !OwnedForms.Any(form => form.Modal || form.OwnedForms.Any(child => child.Modal))))
+                            await NavigateAsync(null);
+                    }));
                 return;
             }
             base.WndProc(ref message);
@@ -1094,6 +1138,7 @@ namespace PcOnSongBridge
             {
                 e.Cancel = true;
                 closingAfterWifi = true;
+                CancelNavigation();
                 wifiWindow.Close();
                 return;
             }

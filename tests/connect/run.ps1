@@ -9,7 +9,7 @@ $stage = Join-Path $tempRoot ('OnSongConnectTests-' + [Guid]::NewGuid().ToString
 try {
     $src = Join-Path $root 'src'
     $sources = @(Get-ChildItem -LiteralPath $src -Filter 'Connect*.cs' -File | Select-Object -ExpandProperty FullName)
-    foreach ($name in 'Audio','LiveSpeech','PlaybackRoute','OnSongActions','Preferences','VoiceCommands') {
+    foreach ($name in 'Audio','LiveSpeech','HandsFreeListening','PlaybackRoute','OnSongActions','Preferences','VoiceCommands') {
         $sources += Join-Path $src ($name + '.cs')
     }
     $exe = Join-Path $stage 'ConnectTests.exe'

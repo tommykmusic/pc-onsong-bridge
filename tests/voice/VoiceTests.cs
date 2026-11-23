@@ -89,6 +89,8 @@ internal static class VoiceTests
         if (installed.Any(r => r.Culture.Name == "en-US"))
             Require(recognizer.Culture.Name == "en-US", "US English should be preferred when present.");
         Console.WriteLine("PASS Recognizer selection (" + recognizer.Culture.Name + ")");
+        // Desktop controls above may have installed a WinForms synchronization context.
+        Task.Run(() => CheckHandsFreeLifecycle(recognizer)).GetAwaiter().GetResult();
         var tone = new byte[16000 * 2];
         for (int i = 0; i < tone.Length / 2; i++)
         {
@@ -122,6 +124,101 @@ internal static class VoiceTests
             var commands = VoiceCommands.ForMode(TabletControlMode.SongSwipes, new[] { binding });
             CheckPhrase(voice, recognizer, binding.Phrase, binding.Id, 1, commands);
         }
+    }
+
+    private static async Task WithinTimeout(Task task, string stage)
+    {
+        Require(await Task.WhenAny(task, Task.Delay(10000)) == task, "Timed out " + stage);
+        await task;
+    }
+
+    private static async Task CheckHandsFreeLifecycle(RecognizerInfo recognizer)
+    {
+        var commands = VoiceCommands.SongCommands.ToArray();
+        var silence = new byte[16000 * Audio.BlockMilliseconds / 1000 * 2];
+        int dispatched = 0;
+        Func<MicrophoneResult, CancellationToken, Task> dispatch = (heard, token) =>
+        {
+            Interlocked.Increment(ref dispatched);
+            return Task.FromResult(true);
+        };
+        using (var stop = new CancellationTokenSource())
+        using (var release = new ManualResetEventSlim())
+        {
+            var ready = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var quiet = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releasing = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            bool closed = false;
+            Task session = Audio.RunHandsFreeInputAsync(recognizer, commands, (accept, opened, cancel) =>
+            {
+                opened(Stopwatch.GetTimestamp());
+                accept(silence, 16000, 1);
+                quiet.SetResult(true);
+                Require(cancel.WaitHandle.WaitOne(10000), "Stop did not reach the silent input.");
+                releasing.SetResult(true);
+                Require(release.Wait(10000), "Source cleanup was never released.");
+                closed = true;
+            }, () => ready.SetResult(true), dispatch, ignored => { }, stop.Token);
+            Func<Task> assertOtherWindowExcluded = async () =>
+            {
+                try
+                {
+                    await Audio.RunHandsFreeInputAsync(recognizer, commands,
+                        (accept, opened, token) => { throw new Exception("A second window opened the microphone."); },
+                        () => { }, dispatch, ignored => { }, CancellationToken.None);
+                    throw new Exception("Overlapping listener started.");
+                }
+                catch (InvalidOperationException error) { Require(error.Message.Contains("other voice control"), error.Message); }
+            };
+            try
+            {
+                await WithinTimeout(Task.WhenAll(ready.Task, quiet.Task), "opening a silent talkback input");
+                await assertOtherWindowExcluded();
+                stop.Cancel();
+                await WithinTimeout(releasing.Task, "canceling a silent talkback input");
+                Require(!session.IsCompleted, "Stop reported completion while the source still owned the input.");
+                await assertOtherWindowExcluded();
+            }
+            finally { stop.Cancel(); release.Set(); }
+            try { await WithinTimeout(session, "releasing the microphone"); throw new Exception("Expected cancellation."); }
+            catch (OperationCanceledException) { }
+            Require(closed, "Listener ended before releasing its silent input.");
+        }
+
+        bool failedReady = false;
+        try
+        {
+            await WithinTimeout(Audio.RunHandsFreeInputAsync(recognizer, commands,
+                (accept, started, cancel) => { throw new IOException("Simulated disconnected input."); },
+                () => failedReady = true, dispatch, ignored => { }, CancellationToken.None), "handling a lost input");
+            throw new Exception("The capture failure was lost.");
+        }
+        catch (IOException error) { Require(error.Message == "Simulated disconnected input.", error.Message); }
+        Require(!failedReady, "A failed input was displayed as ready.");
+        using (var retry = new CancellationTokenSource())
+        {
+            bool retryOpened = false;
+            Task fresh = Audio.RunHandsFreeInputAsync(recognizer, commands, (accept, started, token) =>
+            {
+                started(Stopwatch.GetTimestamp());
+                Require(token.WaitHandle.WaitOne(10000), "The reconnected input stayed open after Stop.");
+            }, () => { retryOpened = true; retry.Cancel(); }, dispatch, ignored => { }, retry.Token);
+            try { await WithinTimeout(fresh, "stopping the reconnected input"); throw new Exception("Expected cancellation."); }
+            catch (OperationCanceledException) { }
+            Require(retryOpened, "A previous input failure blocked the next Start.");
+        }
+
+        using (var stop = new CancellationTokenSource())
+        {
+            var late = new TaskCompletionSource<MicrophoneResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+            Task loop = HandsFreeListening.RunAsync(cancel => late.Task, dispatch, ignored => { }, stop.Token);
+            stop.Cancel();
+            late.SetResult(new MicrophoneResult(-16, "next"));
+            try { await WithinTimeout(loop, "discarding a late result"); throw new Exception("Expected cancellation."); }
+            catch (OperationCanceledException) { }
+        }
+        Require(dispatched == 0, "Silence or a recognition result delivered after Stop sent a tablet command.");
+        Console.WriteLine("PASS exclusive hands-free microphone ownership, silent stop through device cleanup, restart after input loss and canceled late recognition");
     }
 
     private static void CheckSpeechEndpoint()

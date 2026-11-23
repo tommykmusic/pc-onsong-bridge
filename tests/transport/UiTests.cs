@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
+using System.Speech.Recognition;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -11,6 +13,9 @@ using PcOnSongBridge;
 
 internal static class UiTests
 {
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+
     private static IEnumerable<Control> Children(Control root)
     {
         foreach (Control child in root.Controls)
@@ -49,6 +54,105 @@ internal static class UiTests
             writer.Write(silence.Length);
             writer.Write(silence);
         }
+    }
+
+    private sealed class TalkbackMicrophone
+    {
+        internal readonly AudioDevice Device = new AudioDevice(0, "Fixture talkback");
+        internal int Opens;
+        internal CancellationToken SessionToken;
+        internal TaskCompletionSource<bool> Closed;
+        internal Func<MicrophoneResult, CancellationToken, Task> Recognized;
+        internal Action<MicrophoneResult> NoMatch;
+
+        internal Task Open(AudioDevice device, RecognizerInfo recognizer, VoiceCommand[] commands, Action ready,
+            Func<MicrophoneResult, CancellationToken, Task> dispatch, Action<MicrophoneResult> noMatch, CancellationToken token)
+        {
+            if (device != Device || !commands.Any(c => c.Id == "next") || !commands.Any(c => c.Id == "previous"))
+                throw new Exception("Hands-free listening opened with the wrong microphone or command set.");
+            if (Closed != null && !Closed.Task.IsCompleted) throw new Exception("Two microphone sessions overlapped.");
+            Opens++;
+            SessionToken = token;
+            Closed = new TaskCompletionSource<bool>();
+            Recognized = dispatch;
+            NoMatch = noMatch;
+            ready();
+            return Closed.Task;
+        }
+
+        internal Task Say(string id) { return Recognized(new MicrophoneResult(-16, id), SessionToken); }
+    }
+
+    private static async Task ExerciseTalkback(Control[] controls, TalkbackMicrophone mic, string dir)
+    {
+        var listen = controls.OfType<Button>().Single(b => b.Text == "Start listening");
+        var refresh = controls.OfType<Button>().Single(b => b.Text == "Refresh tablets");
+        var verify = controls.OfType<Button>().Single(b => b.Text == "Check navigation");
+        var micRow = (TableLayoutPanel)controls.OfType<Label>().Single(l => l.Text == "Microphone").Parent;
+        var picker = (ComboBox)micRow.GetControlFromPosition(1, 0);
+        var mode = controls.OfType<ComboBox>().Single(c => c.Items.Contains("OnSong arrow shortcuts (foreground)"));
+        await Until(() => verify.Enabled, "initial tablet discovery before the wireless soundcheck");
+        mode.SelectedItem = "OnSong song swipes (foreground)";
+        picker.Items.Add(mic.Device);
+        picker.SelectedItem = mic.Device;
+
+        var wireless = Path.Combine(dir, "wireless-tablet");
+        File.WriteAllText(wireless, "");
+        refresh.PerformClick();
+        await Until(() => verify.Enabled && !listen.Enabled, "fresh wireless tablet discovery");
+        verify.PerformClick();
+        await Until(() => listen.Enabled, "verified wireless tablet");
+        // Model a WM_HOTKEY left in the window queue after F8 was turned off.
+        // Address the fixture window directly so the user's global hotkey stays untouched.
+        SendMessage(listen.FindForm().Handle, 0x0312, new IntPtr(91), new IntPtr((int)Keys.F8 << 16));
+        await Task.Yield();
+        if (mic.Opens != 0) throw new Exception("An F8 message started the microphone while the global hotkey was off.");
+        var trace = Path.Combine(dir, "dispatched-navigation");
+        File.WriteAllText(Path.Combine(dir, "track-navigation"), "");
+        int baseline = File.Exists(trace) ? File.ReadAllLines(trace).Length : 0;
+        listen.PerformClick();
+        await Until(() => listen.Enabled && listen.Text == "Stop listening" && mic.Opens == 1, "latched microphone");
+        mic.NoMatch(new MicrophoneResult(Double.NegativeInfinity, null));
+        await mic.Say("next");
+        mic.NoMatch(new MicrophoneResult(-18, null));
+        await mic.Say("previous");
+        if (listen.Text != "Stop listening" || !listen.Enabled || mic.Opens != 1)
+            throw new Exception("The microphone closed or reopened between commands.");
+        string[] expected = { "-s 192.168.30.2:40501 shell input swipe 1152 1200 448 1200 300",
+            "-s 192.168.30.2:40501 shell input swipe 448 1200 1152 1200 300" };
+        if (!File.ReadAllLines(trace).Skip(baseline).SequenceEqual(expected))
+            throw new Exception("Wireless talkback changed the chart out of order or sent an extra command.");
+
+        listen.PerformClick();
+        if (!mic.SessionToken.IsCancellationRequested) throw new Exception("Second press failed to stop capture.");
+        // A recognizer can return one final result as its audio stream closes.
+        try { await mic.Say("next"); } catch (OperationCanceledException) { }
+        mic.Closed.SetResult(true);
+        await Until(() => listen.Text == "Start listening" && listen.Enabled, "microphone released");
+        listen.PerformClick();
+        await Until(() => mic.Opens == 2 && listen.Text == "Stop listening", "second listening session");
+        string holdReply = Path.Combine(dir, "hold-navigation-reply");
+        File.WriteAllText(holdReply, "");
+        Task sending = mic.Say("next");
+        await Until(() => File.ReadAllLines(trace).Length == baseline + 3, "tablet received command before its delayed reply");
+        if (!listen.Enabled) throw new Exception("Stop listening was unavailable during tablet dispatch.");
+        listen.PerformClick();
+        if (!mic.SessionToken.IsCancellationRequested) throw new Exception("Cannot stop listening during a tablet command.");
+        File.Delete(holdReply);
+        try { await sending; } catch (OperationCanceledException) { }
+        mic.Closed.SetResult(true);
+        await Until(() => listen.Text == "Start listening" && listen.Enabled, "stop during dispatch");
+        listen.PerformClick();
+        await Until(() => mic.Opens == 3 && listen.Text == "Stop listening", "listening after an interrupted reply");
+        mode.SelectedItem = "OnSong arrow shortcuts (foreground)";
+        if (!mic.SessionToken.IsCancellationRequested) throw new Exception("Changing the tablet control mode left the microphone armed.");
+        try { await mic.Say("previous"); } catch (OperationCanceledException) { }
+        mic.Closed.SetResult(true);
+        await Until(() => listen.Text == "Start listening" && verify.Enabled, "changed navigation stops the session");
+        if (listen.Enabled || mic.Opens != 3 || !File.ReadAllLines(trace).Skip(baseline).SequenceEqual(expected.Concat(expected.Take(1))))
+            throw new Exception("A stopped session dispatched a late result or restarted without a button press.");
+        File.Delete(wireless);
+        Console.WriteLine("PASS one button press keeps the same microphone open through silence, ordinary talkback, next and previous over paired wireless ADB; stop, restart and changed navigation discard late speech.");
     }
 
     private static async Task Exercise(MainForm form, string dir)
@@ -357,7 +461,7 @@ internal static class UiTests
     }
 
     [STAThread]
-    public static int Main()
+    public static int Main(string[] args)
     {
         string dir = AppDomain.CurrentDomain.BaseDirectory;
         string settingsPath = Path.Combine(dir, "settings.xml");
@@ -370,19 +474,30 @@ internal static class UiTests
         Application.SetCompatibleTextRenderingDefault(false);
         Exception failure = null;
         var wifiService = new FakeWifi();
-        using (var form = new MainForm(settings, () => wifiService))
+        var mic = new TalkbackMicrophone();
+        using (var form = new MainForm(settings, () => wifiService, mic.Open))
         {
             form.ShowInTaskbar = false;
             form.Opacity = 0;
             form.Shown += async delegate
             {
-                try { await Exercise(form, dir); await ExerciseWifi(form, wifiService, dir); }
+                try
+                {
+                    if (args.Contains("--talkback"))
+                        await ExerciseTalkback(Children(form).ToArray(), mic, dir);
+                    else
+                    {
+                        await Exercise(form, dir);
+                        await ExerciseWifi(form, wifiService, dir);
+                    }
+                }
                 catch (Exception error) { failure = error; }
                 finally { form.Close(); }
             };
             Application.Run(form);
         }
         if (failure != null) { Console.Error.WriteLine(failure); return 1; }
+        if (args.Contains("--talkback")) return 0;
         var saved = Preferences.Load(settingsPath);
         if (saved.Serial != "READY123" || (saved.OutputName != null && String.IsNullOrEmpty(saved.OutputEndpointId)))
             throw new Exception("Selected tablet or playback endpoint was not saved.");

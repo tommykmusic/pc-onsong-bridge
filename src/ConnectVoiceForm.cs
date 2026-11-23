@@ -18,7 +18,7 @@ namespace PcOnSongBridge
         private readonly Button check = new Button { Text = "Check tablet" };
         private readonly Button pair = new Button { Text = "Pair with tablet" };
         private readonly Button developerKey = new Button { Text = "Developer key…" };
-        private readonly Button listen = new Button { Text = "Listen for command" };
+        private readonly Button listen = new Button { Text = "Start listening" };
         private readonly Label status = new Label { AutoSize = true, MaximumSize = new Size(520, 0) };
         private readonly Label speechHint = new Label { AutoSize = true, MaximumSize = new Size(520, 0),
             AccessibleName = "Microphone availability", AccessibleRole = AccessibleRole.StatusBar };
@@ -30,7 +30,8 @@ namespace PcOnSongBridge
         private CancellationTokenSource operation;
         private bool listening, closing, inputsUnavailable;
 
-        internal ConnectVoiceForm(string tabletAddress, AudioDevice selectedMicrophone, ConnectKeyStore keyStore = null)
+        internal ConnectVoiceForm(string tabletAddress, AudioDevice selectedMicrophone, ConnectKeyStore keyStore = null,
+            HandsFreeSession listenSession = null, Func<string, ConnectKeyStore, ConnectSession> openSession = null)
         {
             Text = "Wi-Fi voice control";
             AutoScaleMode = AutoScaleMode.Dpi;
@@ -43,6 +44,8 @@ namespace PcOnSongBridge
             MinimumSize = new Size(540, 430);
             ClientSize = new Size(588, 468);
             keyStore = keyStore ?? new ConnectKeyStore();
+            listenSession = listenSession ?? Audio.ListenHandsFreeAsync;
+            openSession = openSession ?? ConnectSession.Open;
             keyAvailable = ConnectSession.ConfiguredKey(keyStore) != null;
             var panel = new TableLayoutPanel { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(18), ColumnCount = 1 };
             panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -115,20 +118,24 @@ namespace PcOnSongBridge
             {
                 if (session != null) session.Dispose();
                 session = null;
-                session = ConnectSession.Open(address.Text.Trim(), keyStore);
+                session = openSession(address.Text.Trim(), keyStore);
                 string identity = await session.IdentifyAsync(token);
                 status.Text = "Found " + identity + ". " + (keyAvailable ? "Confirm it is your tablet, then pair." : KeyNeeded);
             });
             pair.Click += async (s, e) => await Run(async token =>
             {
                 await session.AuthorizeAsync(token);
-                status.Text = "Paired with " + session.TabletName + ". Choose a command or press Listen for command.";
+                status.Text = "Paired with " + session.TabletName + ". Choose Start listening to use the microphone until you stop it.";
             });
             listen.Click += async (s, e) =>
             {
-                if (listening && operation != null) { operation.Cancel(); return; }
+                if (operation != null)
+                {
+                    if (listening) { operation.Cancel(); UpdateEnabled(); }
+                    return;
+                }
                 listening = true;
-                await Run(Listen);
+                await Run(token => Listen(listenSession, token));
             };
             status.Text = InitialStatus();
             UpdateEnabled();
@@ -200,46 +207,57 @@ namespace PcOnSongBridge
             developerKey.Enabled = idle;
             address.Enabled = microphone.Enabled = refreshMic.Enabled = idle;
             manual.Enabled = idle && approved;
-            listen.Enabled = listening || (idle && approved && recognizer != null && microphone.SelectedItem is AudioDevice);
-            listen.Text = listening ? "Cancel" : "Listen for command";
-            speechHint.Text = SpeechHint();
-            speechHint.Visible = speechHint.Text.Length != 0;
+            bool stopping = listening && operation != null && operation.IsCancellationRequested;
+            listen.Enabled = !closing && !stopping && (listening || (idle && approved && recognizer != null && microphone.SelectedItem is AudioDevice));
+            listen.Text = stopping ? "Stopping…" : listening ? "Stop listening" : "Start listening";
+            if (!listening) SetSpeechHint(SpeechHint());
         }
 
-        private async Task Listen(CancellationToken token)
+        private void SetSpeechHint(string text)
         {
-            var device = (AudioDevice)microphone.SelectedItem;
-            status.Text = "Preparing microphone…";
-            string heard = "";
-            string result = await ListenOnce(
-                cancel => Audio.TestMicrophoneAsync(device, recognizer, commands, cancel, () => BeginInvoke((Action)(() =>
+            speechHint.Text = text;
+            speechHint.Visible = text.Length != 0;
+        }
+
+        private bool IsCurrentListener(CancellationToken token)
+        {
+            return !closing && !IsDisposed && listening && operation != null && operation.Token == token && !token.IsCancellationRequested;
+        }
+
+        private Task Listen(HandsFreeSession run, CancellationToken token)
+        {
+            const string readyHint = "Listening for next song, previous song, scroll up and scroll down.";
+            SetSpeechHint("Opening the command microphone…");
+            status.Text = "";
+            return run((AudioDevice)microphone.SelectedItem, recognizer, commands,
+                () =>
                 {
-                    if (listening && !cancel.IsCancellationRequested)
-                        status.Text = "Listening. Say next song, previous song, scroll up or scroll down.";
-                }))),
-                async (id, cancel) =>
+                    if (IsCurrentListener(token)) SetSpeechHint(readyHint);
+                },
+                async (sample, cancel) =>
                 {
-                    string phrase = commands.Single(c => c.Id == id).Phrase;
+                    token.ThrowIfCancellationRequested();
+                    cancel.ThrowIfCancellationRequested();
+                    string phrase = commands.Single(c => c.Id == sample.Command).Phrase;
                     status.Text = "Sending “" + phrase + "”…";
-                    heard = "“" + phrase + "” · ";
-                    try { return await session.SendAsync(id, cancel); }
+                    SetSpeechHint(readyHint);
+                    ConnectCommandResult reply;
+                    try { reply = await session.SendAsync(sample.Command, cancel); }
                     catch (InvalidOperationException error)
                     {
                         throw new InvalidOperationException("Heard “" + phrase + "”. " + error.Message, error);
                     }
+                    if (IsCurrentListener(token)) status.Text = "“" + phrase + "” · " + FormatReply(sample, reply);
+                },
+                sample =>
+                {
+                    if (IsCurrentListener(token) && !Double.IsNegativeInfinity(sample.PeakDbFs))
+                        SetSpeechHint("Listening. " + Audio.NoCommandMessage(sample.PeakDbFs));
                 }, token);
-            status.Text = heard + result;
         }
 
-        internal static async Task<string> ListenOnce(Func<CancellationToken, Task<MicrophoneResult>> capture,
-            Func<string, CancellationToken, Task<ConnectCommandResult>> send, CancellationToken token)
+        internal static string FormatReply(MicrophoneResult sample, ConnectCommandResult reply)
         {
-            token.ThrowIfCancellationRequested();
-            var sample = await capture(token);
-            token.ThrowIfCancellationRequested();
-            if (String.IsNullOrEmpty(sample.Command)) return Audio.NoCommandMessage(sample.PeakDbFs) +
-                (Double.IsNegativeInfinity(sample.PeakDbFs) ? "" : " Press Listen for command to try again.");
-            var reply = await send(sample.Command, token);
             if (!sample.SpeechEndTimestamp.HasValue || !reply.ConfirmedAt.HasValue) return reply.Message;
             double elapsedMs = (reply.ConfirmedAt.Value - sample.SpeechEndTimestamp.Value) * 1000.0 / Stopwatch.Frequency;
             return String.Format("{0} Tablet confirmation received {1:N0} ms after speech ended.", reply.Message, elapsedMs);
@@ -252,14 +270,20 @@ namespace PcOnSongBridge
             {
                 UpdateEnabled();
                 try { await action(current.Token); }
-                catch (OperationCanceledException) { status.Text = current.IsCancellationRequested ? "Stopped." : "Tablet request timed out. Check its Wi-Fi address."; }
-                catch (Exception error) { status.Text = error.Message; }
+                catch (OperationCanceledException)
+                {
+                    if (!closing) status.Text = current.IsCancellationRequested ? "Listening off." : "Tablet request timed out. Check its Wi-Fi address.";
+                }
+                catch (Exception error) { if (!closing) status.Text = error.Message; }
                 finally
                 {
                     listening = false;
                     operation = null;
-                    UpdateEnabled();
-                    if (closing && !IsDisposed) BeginInvoke((Action)Close);
+                    if (!IsDisposed)
+                    {
+                        UpdateEnabled();
+                        if (closing && IsHandleCreated) BeginInvoke((Action)Close);
+                    }
                 }
             }
         }
@@ -277,7 +301,12 @@ namespace PcOnSongBridge
 
         protected override void Dispose(bool disposing)
         {
-            if (disposing && session != null) session.Dispose();
+            if (disposing)
+            {
+                closing = true;
+                if (operation != null) operation.Cancel();
+                if (session != null) session.Dispose();
+            }
             base.Dispose(disposing);
         }
     }

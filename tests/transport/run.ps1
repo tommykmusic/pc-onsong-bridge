@@ -23,6 +23,10 @@ try {
         if ($LASTEXITCODE) { throw "Could not compile $suite." }
         & $exe
         if ($LASTEXITCODE) { throw "$suite failed." }
+        if ($suite -eq 'UiTests') {
+            & $exe --talkback
+            if ($LASTEXITCODE) { throw 'Hands-free wireless tablet UI tests failed.' }
+        }
     }
 }
 finally {

@@ -101,7 +101,7 @@ namespace PcOnSongBridge
         }
 
         private static long CaptureBlocks(AudioDevice device, int milliseconds, Func<byte[], uint, ushort, bool> receive,
-            CancellationToken token, Action onListening)
+            CancellationToken token, Action onListening, Action<long> onStarted = null)
         {
             token.ThrowIfCancellationRequested();
             WaveFormat format;
@@ -122,10 +122,14 @@ namespace PcOnSongBridge
                 token.ThrowIfCancellationRequested();
                 long started = Stopwatch.GetTimestamp();
                 Check(Native.waveInStart(handle), true, "Start recording");
+                if (onStarted != null) onStarted(started);
                 if (onListening != null) onListening();
-                for (int block = 0; block < milliseconds / BlockMilliseconds; block++)
+                int slot = 0;
+                int remaining = milliseconds / BlockMilliseconds;
+                while (milliseconds == Timeout.Infinite || remaining-- > 0)
                 {
-                    var buffer = buffers[block % buffers.Length];
+                    var buffer = buffers[slot];
+                    slot = (slot + 1) % buffers.Length;
                     var header = WaitForBuffer(buffer, 2000, token);
                     if (header.BytesRecorded != size)
                         throw new InvalidOperationException("The selected microphone stopped delivering audio. Refresh the audio device list and select it again.");
@@ -145,6 +149,28 @@ namespace PcOnSongBridge
                 for (int i = 0; i < buffers.Length; i++)
                     if (buffers[i] != null && (closed || !prepared[i])) buffers[i].Dispose();
             }
+        }
+
+        // Convert one supported WinMM block to the recognizer's mono 16 kHz PCM format.
+        private static int WriteSpeechBlock(byte[] pcm, uint sampleRate, ushort channels, byte[] output, int offset)
+        {
+            int stride = channels * 2;
+            int frames = pcm.Length / stride;
+            int channel = FindLouderChannel(pcm, channels, frames);
+            int count = Math.Min((int)(frames * (long)SpeechSampleRate / sampleRate), (output.Length - offset) / 2);
+            int previous = 0;
+            for (int i = 0; i < count; i++)
+            {
+                int next = (int)((i + 1) * (long)sampleRate / SpeechSampleRate);
+                int sum = 0;
+                for (int frame = previous; frame < next; frame++)
+                    sum += ReadSample(pcm, frame * stride + channel * 2);
+                short sample = (short)(sum / (next - previous));
+                output[offset++] = (byte)sample;
+                output[offset++] = (byte)(sample >> 8);
+                previous = next;
+            }
+            return count * 2;
         }
 
         // SAPI's IStream adapter requires Length and Position before it starts recording.
@@ -170,10 +196,6 @@ namespace PcOnSongBridge
             internal void Append(byte[] pcm, uint sampleRate, ushort channels)
             {
                 // WinMM delivers 20 ms at 16, 44.1 or 48 kHz, all exact integral blocks of 320 output frames.
-                int stride = channels * 2;
-                int frames = pcm.Length / stride;
-                int channel = FindLouderChannel(pcm, channels, frames);
-                int count = (int)(frames * (long)SpeechSampleRate / sampleRate);
                 int blockPeak = 0;
                 for (int offset = 0; offset + 1 < pcm.Length; offset += 2)
                     blockPeak = Math.Max(blockPeak, Math.Abs((int)ReadSample(pcm, offset)));
@@ -191,18 +213,7 @@ namespace PcOnSongBridge
                 }
                 lock (sync)
                 {
-                    int previous = 0;
-                    for (int i = 0; i < count && written + 1 < data.Length; i++)
-                    {
-                        int next = (int)((i + 1) * (long)sampleRate / SpeechSampleRate);
-                        int sum = 0;
-                        for (int frame = previous; frame < next; frame++)
-                            sum += ReadSample(pcm, frame * stride + channel * 2);
-                        short sample = (short)(sum / (next - previous));
-                        data[written++] = (byte)sample;
-                        data[written++] = (byte)(sample >> 8);
-                        previous = next;
-                    }
+                    written += WriteSpeechBlock(pcm, sampleRate, channels, data, written);
                     // Accelerate when trailing blocks drop near silence or back to the initial room floor.
                     int floor = peak > ambientPeak * 3 ? ambientPeak * 2 : 0;
                     if (blockPeak > Math.Max(24, Math.Max(floor, Math.Min(180, peak / 100)))) LastActivity = written;

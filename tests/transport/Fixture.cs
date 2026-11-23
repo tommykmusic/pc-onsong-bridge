@@ -7,6 +7,7 @@ using System.Text;
 using System.Threading;
 class Fixture
 {
+    private const string WirelessSerial = "192.168.30.2:40501";
     [DllImport("winmm.dll", CharSet = CharSet.Unicode)]
     private static extern bool PlaySound(string path, IntPtr module, uint flags);
 
@@ -15,7 +16,10 @@ class Fixture
         string cmd = String.Join(" ", args);
         if (File.Exists("track-fast-input")) File.AppendAllText("fast-input-trace", cmd + Environment.NewLine);
         if (File.Exists("track-navigation") && (cmd.Contains("shell am start") || cmd.Contains("shell input ") && !cmd.EndsWith("input help")))
+        {
             File.AppendAllText("dispatched-navigation", cmd + Environment.NewLine);
+            for (int i = 0; i < 200 && File.Exists("hold-navigation-reply"); i++) Thread.Sleep(25);
+        }
         if (cmd == "--hold-stdio")
         {
             Thread.Sleep(15000);
@@ -72,9 +76,13 @@ class Fixture
             Thread.Sleep(150);
             Console.WriteLine("List of devices attached\nOFF123 unauthorized");
             if (!File.Exists("disconnect"))
-                Console.WriteLine("READY123 device product:test model:test");
+                Console.WriteLine((File.Exists("wireless-tablet") ? WirelessSerial : "READY123") + " device product:test model:test");
             return 0;
         }
+        // Use the same simulated chart for USB and paired wireless debugging.
+        // The dispatch trace above retains the actual serial sent by the bridge.
+        if (cmd.StartsWith("-s " + WirelessSerial + " ", StringComparison.Ordinal) && File.Exists("wireless-tablet"))
+            cmd = "-s READY123 " + cmd.Substring(WirelessSerial.Length + 4);
         if (cmd == "connect 192.168.1.1:65535") Console.WriteLine("connected to 192.168.1.1:65535");
         else if (cmd == "connect 192.168.1.2:40000") Console.WriteLine("failed to connect to 192.168.1.2:40000");
         else if (cmd == "pair [::1]:40000") Console.WriteLine(Console.ReadLine() == "123456" ? "Successfully paired to [::1]:40000" : "pairing error");
