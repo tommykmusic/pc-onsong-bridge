@@ -57,6 +57,7 @@ internal static class LatencyTests
             timings.Add(Measure("continuous low-level noise under speech", next, "next", ids, recognizer, backgroundNoise: true));
             CheckSingleCommand(next, previous, recognizer, ids);
             CheckFailedSource(recognizer, ids);
+            CompareHandsFreeEndpoints(synth, recognizer);
             using (var stop = new CancellationTokenSource(150))
             {
                 var elapsed = Stopwatch.StartNew();
@@ -83,6 +84,7 @@ internal static class LatencyTests
             VoiceCommands.SongCommands, recognizer, 48000, 2, 1);
         if (delay >= 800) throw new InvalidOperationException("Live recognition waited for the fixed capture window.");
         CheckHandsFree(synth, recognizer);
+        CheckHandsFreePrefixesAndRepeats(synth, recognizer);
         CheckHandsFreeInputFailure(Say(synth, "next song"), recognizer);
     }
 
@@ -133,7 +135,43 @@ internal static class LatencyTests
             if (phrase.EndsWith("song", StringComparison.Ordinal)) ends.Add(audio.Count / 32.0);
             audio.AddRange(new byte[(phrase.StartsWith("bring") ? 4800 : 700) * 32]);
         }
-        var pcm = audio.ToArray();
+        var delays = CheckContinuousSequence(recognizer, VoiceCommands.SongCommands, audio.ToArray(), ends,
+            new[] { "next", "previous", "next" }, false);
+        if (delays.Any(d => d < 0 || d > 1000) || delays.OrderBy(d => d).ElementAt(1) > 400)
+            throw new InvalidOperationException("Unexpected continuous recognition latency: " + String.Join(", ", delays));
+        Console.WriteLine("PASS continuous stereo talkback: one mic open, three commands, ordinary speech, extended silence and stop. Waveform end to dispatch: {0} ms.",
+            String.Join(", ", delays.Select(d => d.ToString("0"))));
+    }
+
+    private static void CheckHandsFreePrefixesAndRepeats(SpeechSynthesizer synth, RecognizerInfo recognizer)
+    {
+        var longer = VoiceCommands.CreateBinding("custom", "next song please", "F4", null);
+        var grammar = VoiceCommands.ForMode(TabletControlMode.Automatic, new[] { longer }).ToArray();
+        var audio = new List<byte>(new byte[600 * 32]);
+        var ends = new List<double>();
+        audio.AddRange(Say(synth, "the guitar comes in after the next chorus"));
+        audio.AddRange(new byte[800 * 32]);
+        audio.AddRange(Say(synth, "next song"));
+        audio.AddRange(new byte[200 * 32]);
+        audio.AddRange(Say(synth, "please"));
+        ends.Add(audio.Count / 32.0);
+        audio.AddRange(new byte[750 * 32]);
+        for (int i = 0; i < 2; i++)
+        {
+            audio.AddRange(Say(synth, "previous song"));
+            ends.Add(audio.Count / 32.0);
+            audio.AddRange(new byte[420 * 32]);
+        }
+        var delays = CheckContinuousSequence(recognizer, grammar, audio.ToArray(), ends,
+            new[] { longer.Id, "previous", "previous" }, true);
+        if (delays.Any(d => d < 0 || d > 1300))
+            throw new InvalidOperationException("Early, duplicate, or late hands-free command around a prefix or repeat.");
+        Console.WriteLine("PASS continuous room noise, unrelated talkback containing song words, a paused mapped prefix and consecutive previous commands.");
+    }
+
+    private static List<double> CheckContinuousSequence(RecognizerInfo recognizer, VoiceCommand[] grammar,
+        byte[] pcm, List<double> ends, string[] expected, bool noise, bool verifySongEndpoints = true)
+    {
         var received = new List<string>();
         var delays = new List<double>();
         int opens = 0, ready = 0;
@@ -142,10 +180,10 @@ internal static class LatencyTests
         {
             try
             {
-                Task.Run(() => Audio.RunHandsFreeInputAsync(recognizer, VoiceCommands.SongCommands, (accept, start, token) =>
+                Task.Run(() => Audio.RunHandsFreeInputAsync(recognizer, grammar, (accept, start, token) =>
                 {
                     Interlocked.Increment(ref opens);
-                    Pace(pcm, pcm.Length / 32 + 1800, accept, token, 48000, 2, 1, false, t =>
+                    Pace(pcm, pcm.Length / 32 + 1800, accept, token, 48000, 2, 1, noise, t =>
                     {
                         origin = t;
                         start(t);
@@ -157,16 +195,34 @@ internal static class LatencyTests
                     if (i < ends.Count) delays.Add((Stopwatch.GetTimestamp() - origin) * 1000.0 / Stopwatch.Frequency - ends[i]);
                     if (received.Count == ends.Count) stop.Cancel();
                     return Task.FromResult(0);
-                }, unmatched => { }, stop.Token)).GetAwaiter().GetResult();
+                }, unmatched => { }, stop.Token, verifySongEndpoints)).GetAwaiter().GetResult();
             }
             catch (OperationCanceledException) { if (!stop.IsCancellationRequested) throw; }
         }
-        if (opens != 1 || ready != 1 || !received.SequenceEqual(new[] { "next", "previous", "next" }))
+        if (opens != 1 || ready != 1 || !received.SequenceEqual(expected))
             throw new InvalidOperationException("Continuous recognition returned unexpected commands: " + String.Join(", ", received));
-        if (delays.Any(d => d < 0 || d > 1000))
-            throw new InvalidOperationException("Unexpected continuous recognition latency: " + String.Join(", ", delays));
-        Console.WriteLine("PASS continuous stereo talkback: one mic open, three commands, ordinary speech, extended silence and stop. Waveform end to dispatch: {0} ms.",
-            String.Join(", ", delays.Select(d => d.ToString("0"))));
+        return delays;
+    }
+
+    private static void CompareHandsFreeEndpoints(SpeechSynthesizer synth, RecognizerInfo recognizer)
+    {
+        var audio = new List<byte>(new byte[500 * 32]);
+        var ends = new List<double>();
+        foreach (string phrase in new[] { "next song", "previous song", "next song" })
+        {
+            audio.AddRange(Say(synth, phrase));
+            ends.Add(audio.Count / 32.0);
+            audio.AddRange(new byte[700 * 32]);
+        }
+        var pcm = audio.ToArray();
+        var expected = new[] { "next", "previous", "next" };
+        var normal = CheckContinuousSequence(recognizer, VoiceCommands.SongCommands, pcm, ends, expected, false, false);
+        var verified = CheckContinuousSequence(recognizer, VoiceCommands.SongCommands, pcm, ends, expected, false);
+        double normalMedian = normal.OrderBy(x => x).ElementAt(1), fastMedian = verified.OrderBy(x => x).ElementAt(1);
+        Console.WriteLine("Hands-free acoustic end to dispatch for identical paced input: normal {0:0} ms, verified {1:0} ms (medians).",
+            normalMedian, fastMedian);
+        if (verified.Any(d => d < 0) || fastMedian >= normalMedian - 80)
+            throw new InvalidOperationException("Early song recognition did not improve median dispatch by 80 ms.");
     }
 
     private static void CheckSingleCommand(byte[] first, byte[] second, RecognizerInfo recognizer, VoiceCommand[] commands)

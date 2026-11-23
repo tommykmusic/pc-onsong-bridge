@@ -1022,10 +1022,18 @@ namespace PcOnSongBridge
             CommandDelivery delivery = await DispatchAsync(serial, action, mode, false, token);
             if (closing) return;
             activity.Text = delivery.Message;
+            string timingDetail = "";
             if (sample != null && sample.SpeechEndTimestamp.HasValue)
+            {
+                double toMilliseconds = 1000.0 / Stopwatch.Frequency;
                 activity.Text += String.Format(CultureInfo.CurrentCulture, "  Sent to Android in {0:N0} ms (chart not verified).",
-                    (delivery.Acknowledged - sample.SpeechEndTimestamp.Value) * 1000.0 / Stopwatch.Frequency);
-            WriteLog("Sent " + (sample != null ? "voice" : "manual") + " command: " + action.Phrase.ToLowerInvariant() + ". " + activity.Text);
+                    (delivery.Acknowledged - sample.SpeechEndTimestamp.Value) * toMilliseconds);
+                timingDetail = String.Format(CultureInfo.CurrentCulture,
+                    "  Detected speech end to dispatch {0:N0} ms. Dispatch to Android acknowledgment {1:N0} ms.",
+                    (delivery.DispatchStarted - sample.SpeechEndTimestamp.Value) * toMilliseconds,
+                    (delivery.Acknowledged - delivery.DispatchStarted) * toMilliseconds);
+            }
+            WriteLog("Sent " + (sample != null ? "voice" : "manual") + " command: " + action.Phrase.ToLowerInvariant() + ". " + activity.Text + timingDetail);
         }
 
         private Task<CommandDelivery> DispatchAsync(string serial, VoiceCommand command, TabletControlMode mode, bool observe,

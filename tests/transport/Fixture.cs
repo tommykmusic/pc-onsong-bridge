@@ -11,10 +11,13 @@ class Fixture
     [DllImport("winmm.dll", CharSet = CharSet.Unicode)]
     private static extern bool PlaySound(string path, IntPtr module, uint flags);
 
-    static int Main(string[] args)
+    static int Main(string[] args) { return Run(args, true); }
+
+    private static int Run(string[] args, bool hostInvocation)
     {
         string cmd = String.Join(" ", args);
-        if (File.Exists("track-fast-input")) File.AppendAllText("fast-input-trace", cmd + Environment.NewLine);
+        if (File.Exists("track-fast-input"))
+            File.AppendAllText("fast-input-trace", (hostInvocation ? cmd : "remote " + String.Join(" ", args, 3, args.Length - 3)) + Environment.NewLine);
         if (File.Exists("track-navigation") && (cmd.Contains("shell am start") || cmd.Contains("shell input ") && !cmd.EndsWith("input help")))
         {
             File.AppendAllText("dispatched-navigation", cmd + Environment.NewLine);
@@ -83,6 +86,8 @@ class Fixture
         // The dispatch trace above retains the actual serial sent by the bridge.
         if (cmd.StartsWith("-s " + WirelessSerial + " ", StringComparison.Ordinal) && File.Exists("wireless-tablet"))
             cmd = "-s READY123 " + cmd.Substring(WirelessSerial.Length + 4);
+        if (cmd.StartsWith("-s READY123 shell -T (dumpsys window displays ", StringComparison.Ordinal))
+            return ShortcutShell(args[1]);
         if (cmd == "connect 192.168.1.1:65535") Console.WriteLine("connected to 192.168.1.1:65535");
         else if (cmd == "connect 192.168.1.2:40000") Console.WriteLine("failed to connect to 192.168.1.2:40000");
         else if (cmd == "pair [::1]:40000") Console.WriteLine(Console.ReadLine() == "123456" ? "Successfully paired to [::1]:40000" : "pairing error");
@@ -146,6 +151,42 @@ class Fixture
         }
         else { Console.Error.WriteLine("unexpected " + cmd); return 5; }
         return 0;
+    }
+
+    private static int ShortcutShell(string serial)
+    {
+        if (File.Exists("hold-shortcut-focus"))
+        {
+            File.WriteAllText("shortcut-focus-pending", "");
+            while (File.Exists("hold-shortcut-focus")) Thread.Sleep(10);
+        }
+        if (!File.Exists("legacy-focus-output")) WriteFocusedWindows();
+        Console.WriteLine("BRIDGE_FOCUS_END");
+        string line = Console.ReadLine();
+        if (line != null && line.StartsWith("(dumpsys window ||", StringComparison.Ordinal))
+        {
+            if (File.Exists("track-fast-input")) File.AppendAllText("fast-input-trace", "remote dumpsys window" + Environment.NewLine);
+            WriteFocusedWindows();
+            Console.WriteLine("BRIDGE_FOCUS_END");
+            line = Console.ReadLine();
+        }
+        if (line == null) return 0;
+        const string receipt = " && echo BRIDGE_SHORTCUT_SENT";
+        if (!line.StartsWith("input ", StringComparison.Ordinal) || !line.EndsWith(receipt, StringComparison.Ordinal)) return 6;
+        string input = line.Substring(0, line.Length - receipt.Length);
+        int code = Run(("-s " + serial + " shell " + input).Split(' '), false);
+        if (code == 0 && !File.Exists("shortcut-receipt-lost")) Console.WriteLine("BRIDGE_SHORTCUT_SENT");
+        return code;
+    }
+
+    private static void WriteFocusedWindows()
+    {
+        Console.WriteLine("  mCurrentFocus=null");
+        Console.WriteLine(File.Exists("other-foreground")
+            ? "  mCurrentFocus=Window{1234 u0 com.android.launcher3/.MainActivity}"
+            : "  mCurrentFocus=Window{1234 u0 com.onsongapp.app/.MainActivity}");
+        if (File.Exists("secondary-overlay")) Console.WriteLine("  mCurrentFocus=Window{4321 u0 NotificationShade}");
+        if (File.Exists("focus-dump-failed")) Console.WriteLine("BRIDGE_DUMP_FAILED");
     }
 
     private static void WriteShortcutEditor()

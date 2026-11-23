@@ -117,8 +117,9 @@ internal static class ControlTransportTests
         File.WriteAllText(trace, "");
         CommandDispatch.SendAsync(bridge, tablet, mode, next, false, token).GetAwaiter().GetResult();
         var lines = File.ReadAllLines(trace);
-        Check(lines.Length == 2 && lines[0].EndsWith("window displays") && lines[1].EndsWith("keycombination KEYCODE_CTRL_LEFT KEYCODE_SHIFT_LEFT KEYCODE_N"),
-            "Live next should only check foreground and send one chord.");
+        Check(lines.Length == 2 && lines[0].StartsWith("-s " + tablet + " shell -T (dumpsys window displays ") &&
+            lines[1] == "remote input keycombination KEYCODE_CTRL_LEFT KEYCODE_SHIFT_LEFT KEYCODE_N",
+            "Live next must use a single ADB shell with a fresh focus check and one chord.");
         Check(File.ReadAllText(index) == "54", "Fast next did not move to the adjacent song.");
 
         File.WriteAllText(trace, "");
@@ -144,7 +145,33 @@ internal static class ControlTransportTests
         File.WriteAllText(trace, "");
         CommandDispatch.SendAsync(bridge, tablet, mode, previous, false, token).GetAwaiter().GetResult();
         lines = File.ReadAllLines(trace);
-        Check(lines.Length == 3 && lines[0].EndsWith("window displays") && lines[1].EndsWith("dumpsys window") &&
+        Check(lines.Length == 3 && lines[0].Contains("dumpsys window displays") && lines[1] == "remote dumpsys window" &&
             lines[2].EndsWith("KEYCODE_P"), "Android builds without a compact focus field must use the full focus check.");
+        File.Delete(Path.Combine(dir, "legacy-focus-output"));
+
+        foreach (string denied in new[] { "secondary-overlay", "focus-dump-failed" })
+        {
+            File.WriteAllText(Path.Combine(dir, denied), "");
+            File.WriteAllText(trace, "");
+            RequireFailure<InvalidOperationException>(() => CommandDispatch.SendAsync(bridge, tablet, mode, next, false, token).GetAwaiter().GetResult());
+            Check(File.ReadAllLines(trace).Length == 1, "An ambiguous or interrupted foreground check sent input.");
+            File.Delete(Path.Combine(dir, denied));
+        }
+        string hold = Path.Combine(dir, "hold-shortcut-focus");
+        File.WriteAllText(hold, "");
+        File.WriteAllText(trace, "");
+        using (var cancel = new CancellationTokenSource())
+        {
+            var pending = CommandDispatch.SendAsync(bridge, tablet, mode, next, false, cancel.Token);
+            Check(SpinWait.SpinUntil(() => File.Exists(Path.Combine(dir, "shortcut-focus-pending")), 5000), "Missing shortcut focus check.");
+            cancel.Cancel();
+            RequireFailure<OperationCanceledException>(() => pending.GetAwaiter().GetResult());
+        }
+        File.Delete(hold);
+        Check(File.ReadAllLines(trace).Length == 1, "Stop during focus verification still sent a shortcut.");
+        File.WriteAllText(Path.Combine(dir, "shortcut-receipt-lost"), "");
+        File.WriteAllText(trace, "");
+        RequireFailure<InvalidOperationException>(() => CommandDispatch.SendAsync(bridge, tablet, mode, next, false, token).GetAwaiter().GetResult());
+        Check(File.ReadAllLines(trace).Length == 2 && File.ReadAllText(index) == "54", "A lost acknowledgment must not repeat a song change.");
     }
 }

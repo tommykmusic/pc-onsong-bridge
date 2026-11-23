@@ -429,18 +429,25 @@ namespace PcOnSongBridge
                 command += " " + option + " 1400";
             }
             else if (keys.Length > 1) await EnsureChordSupportAsync(device, cancellationToken).ConfigureAwait(false);
-            string initialWindow = await ConfirmOnSongFocusAsync(device, cancellationToken, compact: !teach).ConfigureAwait(false);
+            string input = "input " + command + " " + String.Join(" ", keys);
+            string result;
             if (teach)
             {
+                string initialWindow = await ConfirmOnSongFocusAsync(device, cancellationToken).ConfigureAwait(false);
                 string layout = await ReadOnSongLayoutAsync(device, cancellationToken).ConfigureAwait(false);
                 if (!SongViewer.IsShortcutEditor(layout))
                     throw new InvalidOperationException("On the tablet, open OnSong's Foot Pedals button, select Shortcuts and scroll to System Defined. Then try again.");
                 string finalWindow = await ConfirmOnSongFocusAsync(device, cancellationToken).ConfigureAwait(false);
                 if (FocusedComponent.Match(initialWindow).Value.Trim() != FocusedComponent.Match(finalWindow).Value.Trim())
                     throw new InvalidOperationException("The OnSong window changed. Return to Shortcuts and try again.");
+                result = await RunAdbAsync("-s " + device + " shell " + input, dispatchToken: cancellationToken).ConfigureAwait(false);
             }
-            string result = await RunAdbAsync("-s " + device + " shell input " + command + " " + String.Join(" ", keys),
-                dispatchToken: cancellationToken).ConfigureAwait(false);
+            else
+            {
+                // Send the validated keys only after checking this request's foreground reply.
+                result = await RunAdbAsync("-s " + device + " shell -T " + FocusQuery(true) + "; exec sh",
+                    dispatchToken: cancellationToken, exchange: p => SendAfterFocusAsync(p, input, cancellationToken)).ConfigureAwait(false);
+            }
             if (Regex.IsMatch(result, @"(?im)^\s*(error|exception|usage|failed|unknown)\b"))
                 throw new InvalidOperationException("Android did not accept the shortcut.");
             return teach ? "Held " + shortcut.Label + ". On the tablet, choose the desired action and check the assignment under User Defined."
@@ -552,29 +559,98 @@ namespace PcOnSongBridge
             // Some Android builds expose focus only in the full dump. A reported null or foreign focus still fails closed.
             if (compact && result.IndexOf("mCurrentFocus=", StringComparison.Ordinal) < 0)
                 result = await RunAdbAsync(command, executionToken: cancellationToken).ConfigureAwait(false);
-            MatchCollection windows = FocusedComponent.Matches(result);
-            if (windows.Count != 1 || !String.Equals(windows[0].Groups[1].Value, OnSongPackage, StringComparison.Ordinal))
-                throw new InvalidOperationException("Open OnSong on the unlocked tablet and dismiss any overlay before using song navigation.");
+            RequireOnSongFocus(result);
             return result;
         }
 
+        private static void RequireOnSongFocus(string result)
+        {
+            // A secondary display can have null focus. An overlay (including a window with
+            // no package/activity component) or two focused windows makes input ambiguous.
+            var active = result.Split('\n').Select(line => line.Trim())
+                .Where(line => line.StartsWith("mCurrentFocus=", StringComparison.Ordinal) && line != "mCurrentFocus=null").ToArray();
+            Match window = active.Length == 1 ? FocusedComponent.Match(active[0]) : Match.Empty;
+            if (!window.Success || !String.Equals(window.Groups[1].Value, OnSongPackage, StringComparison.Ordinal))
+                throw new InvalidOperationException("Open OnSong on the unlocked tablet and dismiss any overlay before using song navigation.");
+        }
+
+        private const string FocusEnd = "BRIDGE_FOCUS_END";
+        private const string DumpFailed = "BRIDGE_DUMP_FAILED";
+        private const string ShortcutSent = "BRIDGE_SHORTCUT_SENT";
+
+        private static string FocusQuery(bool compact)
+        {
+            return "(dumpsys window" + (compact ? " displays" : "") + " || echo " + DumpFailed +
+                ") | grep -E '^[[:space:]]*mCurrentFocus=|^" + DumpFailed + "$'; echo " + FocusEnd;
+        }
+
+        private static async Task<string> SendAfterFocusAsync(Process process, string input, CancellationToken cancel)
+        {
+            using (var writer = process.StandardInput)
+            {
+                writer.NewLine = "\n";
+                using (cancel.Register(() => KillIfRunning(process)))
+                {
+                    string focus = await ReadFocusReplyAsync(process.StandardOutput, cancel).ConfigureAwait(false);
+                    if (focus.IndexOf("mCurrentFocus=", StringComparison.Ordinal) < 0)
+                    {
+                        cancel.ThrowIfCancellationRequested();
+                        writer.WriteLine(FocusQuery(false));
+                        focus = await ReadFocusReplyAsync(process.StandardOutput, cancel).ConfigureAwait(false);
+                    }
+                    RequireOnSongFocus(focus);
+                }
+                cancel.ThrowIfCancellationRequested();
+                // Once submitted, wait for the actual receipt even if Stop is pressed.
+                writer.WriteLine(input + " && echo " + ShortcutSent);
+            }
+            string reply = await ReadAdbOutputAsync(process.StandardOutput, 64 * 1024).ConfigureAwait(false);
+            if (reply != null) reply = reply.TrimEnd();
+            if (reply == null || !(reply == ShortcutSent || reply.EndsWith("\n" + ShortcutSent, StringComparison.Ordinal)))
+                throw new InvalidOperationException("Android did not confirm the shortcut. Check the chart before trying again.");
+            return reply.Substring(0, reply.Length - ShortcutSent.Length);
+        }
+
+        private static async Task<string> ReadFocusReplyAsync(StreamReader reader, CancellationToken cancel)
+        {
+            var buffer = new char[1024];
+            var reply = new StringBuilder();
+            int count;
+            while ((count = await reader.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false)) != 0)
+            {
+                cancel.ThrowIfCancellationRequested();
+                reply.Append(buffer, 0, count);
+                if (reply.Length > 16384) break;
+                if (reply[reply.Length - 1] != '\n') continue;
+                string text = reply.ToString().Replace("\r\n", "\n");
+                if (text == FocusEnd + "\n" || text.EndsWith("\n" + FocusEnd + "\n", StringComparison.Ordinal))
+                {
+                    if (text.IndexOf(DumpFailed, StringComparison.Ordinal) >= 0) break;
+                    return text;
+                }
+            }
+            cancel.ThrowIfCancellationRequested();
+            throw new InvalidOperationException("The tablet did not return a complete foreground check. Check its connection.");
+        }
+
         private Task<string> RunAdbAsync(string arguments, string stdin = null,
-            CancellationToken dispatchToken = default(CancellationToken), CancellationToken executionToken = default(CancellationToken))
+            CancellationToken dispatchToken = default(CancellationToken), CancellationToken executionToken = default(CancellationToken),
+            Func<Process, Task<string>> exchange = null)
         {
             lock (sessionLock)
                 ThrowIfDisposed();
 
-            return Task.Run(() =>
+            return Task.Run(async () =>
             {
                 using (Process process = NewProcess(adbPath, arguments))
                 {
-                    process.StartInfo.RedirectStandardInput = stdin != null;
+                    process.StartInfo.RedirectStandardInput = stdin != null || exchange != null;
                     dispatchToken.ThrowIfCancellationRequested();
                     executionToken.ThrowIfCancellationRequested();
                     process.Start();
                     using (executionToken.Register(() => KillIfRunning(process)))
                     {
-                        Task<string> stdout = ReadAdbOutputAsync(process.StandardOutput, 8 * 1024 * 1024);
+                        Task<string> stdout = exchange == null ? ReadAdbOutputAsync(process.StandardOutput, 8 * 1024 * 1024) : exchange(process);
                         Task<string> stderr = ReadAdbOutputAsync(process.StandardError, 64 * 1024);
                         if (stdin != null)
                         {
@@ -586,14 +662,15 @@ namespace PcOnSongBridge
                             catch (IOException) { }
                         }
                         Stopwatch elapsed = Stopwatch.StartNew();
-                        if (!process.WaitForExit(CommandTimeoutMs)
-                            || !Task.WaitAll(new Task[] { stdout, stderr },
-                                Math.Max(0, CommandTimeoutMs - (int)elapsed.ElapsedMilliseconds), executionToken))
+                        var drains = Task.WhenAll(stdout, stderr);
+                        if (!process.WaitForExit(CommandTimeoutMs) || await Task.WhenAny(drains,
+                            Task.Delay(Math.Max(0, CommandTimeoutMs - (int)elapsed.ElapsedMilliseconds), executionToken)).ConfigureAwait(false) != drains)
                         {
                             KillIfRunning(process);
                             throw new TimeoutException("ADB did not respond in 20 seconds. Check the tablet connection and retry.");
                         }
                         executionToken.ThrowIfCancellationRequested();
+                        await drains.ConfigureAwait(false);
                         if (process.ExitCode != 0)
                         {
                             if (stdin != null)

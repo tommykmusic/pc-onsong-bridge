@@ -80,7 +80,10 @@ internal static class UiTests
             return Closed.Task;
         }
 
-        internal Task Say(string id) { return Recognized(new MicrophoneResult(-16, id), SessionToken); }
+        internal Task Say(string id)
+        {
+            return Recognized(new MicrophoneResult(-16, id, speechEndTimestamp: Stopwatch.GetTimestamp()), SessionToken);
+        }
     }
 
     private static async Task ExerciseTalkback(Control[] controls, TalkbackMicrophone mic, string dir)
@@ -116,6 +119,10 @@ internal static class UiTests
         await mic.Say("next");
         mic.NoMatch(new MicrophoneResult(-18, null));
         await mic.Say("previous");
+        var activity = controls.OfType<TextBox>().Single(box => box.Multiline && box.ReadOnly);
+        if (activity.Lines.Count(line => line.Contains("Detected speech end to dispatch") &&
+            line.Contains("Dispatch to Android acknowledgment")) != 2)
+            throw new Exception("Each completed voice command must report both timing intervals.");
         if (listen.Text != "Stop listening" || !listen.Enabled || mic.Opens != 1)
             throw new Exception("The microphone closed or reopened between commands.");
         string[] expected = { "-s 192.168.30.2:40501 shell input swipe 1152 1200 448 1200 300",

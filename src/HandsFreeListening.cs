@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Runtime.ExceptionServices;
 using System.Speech.AudioFormat;
 using System.Speech.Recognition;
@@ -46,7 +48,8 @@ namespace PcOnSongBridge
         }
 
         internal static async Task RunHandsFreeInputAsync(RecognizerInfo recognizer, VoiceCommand[] commands, OpenSpeechInput open,
-            Action ready, Func<MicrophoneResult, CancellationToken, Task> dispatch, Action<MicrophoneResult> noMatch, CancellationToken token)
+            Action ready, Func<MicrophoneResult, CancellationToken, Task> dispatch, Action<MicrophoneResult> noMatch, CancellationToken token,
+            bool verifySongEndpoints = true)
         {
             token.ThrowIfCancellationRequested();
             if (Interlocked.CompareExchange(ref handsFreeActive, 1, 0) != 0)
@@ -59,7 +62,7 @@ namespace PcOnSongBridge
                     var opened = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
                     var worker = Task.Run(() =>
                     {
-                        try { RecognizeHandsFree(recognizer, commands, open, opened, results, lifetime); }
+                        try { RecognizeHandsFree(recognizer, commands, open, opened, results, lifetime, verifySongEndpoints); }
                         finally { results.CompleteAdding(); }
                     });
                     Exception failure = null;
@@ -101,7 +104,8 @@ namespace PcOnSongBridge
         }
 
         private static void RecognizeHandsFree(RecognizerInfo recognizer, VoiceCommand[] commands, OpenSpeechInput open,
-            TaskCompletionSource<bool> opened, BlockingCollection<MicrophoneResult> results, CancellationTokenSource lifetime)
+            TaskCompletionSource<bool> opened, BlockingCollection<MicrophoneResult> results, CancellationTokenSource lifetime,
+            bool verifySongEndpoints)
         {
             var token = lifetime.Token;
             using (var engine = new SpeechRecognitionEngine(recognizer))
@@ -116,6 +120,18 @@ namespace PcOnSongBridge
                 engine.EndSilenceTimeout = TimeSpan.FromMilliseconds(120);
                 engine.EndSilenceTimeoutAmbiguous = TimeSpan.FromMilliseconds(PrefixPauseMilliseconds);
                 engine.SetInputToAudioStream(input, new SpeechAudioFormatInfo(SpeechSampleRate, AudioBitsPerSample.Sixteen, AudioChannel.Mono));
+                Action<MicrophoneResult> publish = result =>
+                {
+                    if (stopInput.IsCancellationRequested || (result.Command == null && results.Count > 0)) return;
+                    if (!results.TryAdd(result) && result.Command != null)
+                        throw new InvalidOperationException("Tablet control fell behind the microphone. Check the connection and start listening again.");
+                };
+                var fast = new SongEndpoint(recognizer, commands, input, publish, token);
+                if (verifySongEndpoints)
+                {
+                    engine.SpeechDetected += (sender, e) => fast.Begin(e.AudioPosition);
+                    engine.SpeechHypothesized += (sender, e) => fast.Hypothesis(e.Result.Text);
+                }
                 Action<RecognitionResult, bool> heard = (speech, accepted) =>
                 {
                     if (stopInput.IsCancellationRequested) return;
@@ -124,10 +140,7 @@ namespace PcOnSongBridge
                         double peak = SpeechPeak(speech);
                         var result = accepted ? AcceptedResult(speech, commands, peak, Interlocked.Read(ref firstSample)) :
                             new MicrophoneResult(peak, null);
-                        // A slow tablet needs the pending commands, not a backlog of microphone level hints.
-                        if (result.Command == null && results.Count > 0) return;
-                        if (!results.TryAdd(result) && result.Command != null)
-                            throw new InvalidOperationException("Tablet control fell behind the microphone. Check the connection and start listening again.");
+                        fast.Finish(result);
                     }
                     catch (Exception error)
                     {
@@ -155,7 +168,9 @@ namespace PcOnSongBridge
                     open((pcm, rate, channels) =>
                     {
                         stopInput.Token.ThrowIfCancellationRequested();
-                        input.Append(block, WriteSpeechBlock(pcm, rate, channels, block, 0));
+                        int count = WriteSpeechBlock(pcm, rate, channels, block, 0);
+                        long written = input.Append(block, count);
+                        fast.Check(block, count, written, Interlocked.Read(ref firstSample));
                         return true;
                     }, timestamp =>
                     {
@@ -175,9 +190,131 @@ namespace PcOnSongBridge
                     input.Complete();
                     if (stopInput.IsCancellationRequested && !completed.IsSet) engine.RecognizeAsyncCancel();
                     completed.Wait();
+                    fast.WaitForVerifier();
                 }
                 if (failure != null) throw new InvalidOperationException("Voice listening stopped. " + failure.Message, failure);
                 token.ThrowIfCancellationRequested();
+            }
+        }
+
+        // The continuous engine identifies the start of an utterance and its possible words.
+        // A separate final recognition of the complete, quiet-ended audio can finish sooner.
+        private sealed class SongEndpoint
+        {
+            private const int BytesPerMillisecond = SpeechSampleRate * 2 / 1000;
+            private readonly object gate = new object();
+            private readonly RecognizerInfo recognizer;
+            private readonly VoiceCommand[] grammar;
+            private readonly VoiceCommand[] songs;
+            private readonly TalkbackStream stream;
+            private readonly Action<MicrophoneResult> publish;
+            private readonly CancellationToken token;
+            private long start = -1, lastLoud, checkedStart, checkedLoud;
+            private int floor;
+            private string possible;
+            private bool sent;
+            private Task<MicrophoneResult> verifier;
+
+            internal SongEndpoint(RecognizerInfo recognizer, VoiceCommand[] grammar, TalkbackStream stream,
+                Action<MicrophoneResult> publish, CancellationToken token)
+            {
+                this.recognizer = recognizer;
+                this.grammar = grammar;
+                this.stream = stream;
+                this.publish = publish;
+                this.token = token;
+                songs = grammar.Where(c => (c.Id == "next" || c.Id == "previous") && !grammar.Any(other =>
+                    other.Phrase.StartsWith(c.Phrase + " ", StringComparison.OrdinalIgnoreCase))).ToArray();
+            }
+
+            internal void Begin(TimeSpan position)
+            {
+                lock (gate)
+                {
+                    start = (long)Math.Round(position.TotalSeconds * SpeechSampleRate) * 2;
+                    lastLoud = start;
+                    var room = stream.CopyRange(Math.Max(0, start - 240 * BytesPerMillisecond), start, 0);
+                    floor = RoomThreshold(room);
+                    possible = null;
+                    sent = false;
+                }
+            }
+
+            private static int RoomThreshold(byte[] room)
+            {
+                const int block = BlockMilliseconds * SpeechSampleRate * 2 / 1000;
+                if (room == null || room.Length < block * 3) return 24;
+                var peaks = new int[room.Length / block];
+                for (int i = 0; i < peaks.Length; i++)
+                    for (int j = i * block; j < (i + 1) * block; j += 2)
+                        peaks[i] = Math.Max(peaks[i], Math.Abs((int)ReadSample(room, j)));
+                Array.Sort(peaks);
+                // Cap the room estimate so background noise cannot qualify speech as silence.
+                return Math.Max(24, Math.Min(600, peaks[peaks.Length / 2] * 2));
+            }
+
+            internal void Hypothesis(string text)
+            {
+                lock (gate)
+                {
+                    var song = songs.FirstOrDefault(c => c.Phrase.Equals(text, StringComparison.OrdinalIgnoreCase) ||
+                        c.Phrase.StartsWith(text + " ", StringComparison.OrdinalIgnoreCase));
+                    possible = song == null ? null : song.Id;
+                }
+            }
+
+            internal void Check(byte[] block, int count, long written, long origin)
+            {
+                lock (gate)
+                {
+                    if (start < 0 || sent || token.IsCancellationRequested) return;
+                    for (int i = 0; i < count; i += 2)
+                        if (Math.Abs((int)ReadSample(block, i)) > floor) { lastLoud = written; break; }
+                    if (verifier != null && verifier.IsCompleted)
+                    {
+                        var result = verifier.GetAwaiter().GetResult();
+                        verifier = null;
+                        if (result != null && result.Command != null && result.Command == possible &&
+                            start == checkedStart && lastLoud == checkedLoud)
+                        {
+                            sent = true;
+                            publish(result);
+                            return;
+                        }
+                    }
+                    long duration = written - start;
+                    if (verifier != null || possible == null || checkedLoud == lastLoud || duration <= 0 ||
+                        duration > 3 * SpeechSampleRate * 2 || written - lastLoud < 140 * BytesPerMillisecond) return;
+                    var samples = stream.CopyRange(start, written, SpeechSampleRate);
+                    if (samples == null) return;
+                    checkedLoud = lastLoud;
+                    checkedStart = start;
+                    long clipClock = origin + (long)(start * (double)Stopwatch.Frequency / (SpeechSampleRate * 2));
+                    long ticks = duration * Stopwatch.Frequency / (SpeechSampleRate * 2);
+                    verifier = Task.Run(() =>
+                    {
+                        var result = ConfirmEndpoint(samples, recognizer, grammar, token);
+                        return result == null ? null : ToCaptureClock(result, clipClock, ticks, result.PeakDbFs);
+                    });
+                }
+            }
+
+            internal void Finish(MicrophoneResult result)
+            {
+                lock (gate)
+                {
+                    if (!sent) publish(result);
+                    start = -1;
+                    possible = null;
+                    sent = false;
+                }
+            }
+
+            internal void WaitForVerifier()
+            {
+                if (verifier == null) return;
+                try { verifier.GetAwaiter().GetResult(); }
+                catch (OperationCanceledException) { if (!token.IsCancellationRequested) throw; }
             }
         }
 
@@ -203,7 +340,7 @@ namespace PcOnSongBridge
             private long written, position;
             private bool complete;
 
-            internal void Append(byte[] block, int count)
+            internal long Append(byte[] block, int count)
             {
                 lock (sync)
                 {
@@ -215,6 +352,21 @@ namespace PcOnSongBridge
                     Buffer.BlockCopy(block, first, ring, 0, count - first);
                     written += count;
                     Monitor.PulseAll(sync);
+                    return written;
+                }
+            }
+            internal byte[] CopyRange(long start, long end, int padding)
+            {
+                lock (sync)
+                {
+                    if (start < Math.Max(0, written - ring.Length) || end > written || end < start) return null;
+                    int count = (int)(end - start);
+                    var sample = new byte[count + padding];
+                    int slot = (int)(start % ring.Length);
+                    int first = Math.Min(count, ring.Length - slot);
+                    Buffer.BlockCopy(ring, slot, sample, 0, first);
+                    Buffer.BlockCopy(ring, 0, sample, first, count - first);
+                    return sample;
                 }
             }
             internal void Complete() { lock (sync) { complete = true; Monitor.PulseAll(sync); } }
