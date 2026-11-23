@@ -1,0 +1,15 @@
+/dist/
+/bin/
+/obj/
+/.vs/
+/assets/bridge.png
+/soundcheck/
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.key
+*.pem
+*.log
+*.user
